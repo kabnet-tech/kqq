@@ -3,14 +3,35 @@
 **SQL for streams.** Query NDJSON, JSON, CSV, and LLM token streams with SQL —
 at memory speeds, not disk speeds.
 
+```bash
+cat logs.ndjson | kqq 'select service, count(), avg(latency_ms) group by service'
+```
+
+## jq vs kqq
+
+Same query — group 1M rows by a field and compute `count()` + `avg()` — on the
+same machine:
+
+| Metric | jq | kqq | |
+|---|---|---|---|
+| Time | ~8 s | ~0.5 s | **16× faster** |
+| Peak memory | ~1 GB | ~7 MB | **150× less** |
+| Input size | buffers everything | streams, O(1) per group | |
+
+| Problem | jq | kqq |
+|---|---|---|
+| "First 5 errors in a 2 GB log" | scans everything | early-stop in milliseconds |
+| CSV export | `@csv` ceremony | `--csv` flag |
+| Learning curve | functional language | SQL |
+
+kqq is **not** a jq replacement. It's purpose-built for the 80% of queries that
+are filter → project → aggregate → export. For recursive descent, custom
+functions, or Turing-complete transforms, use jq.
+
 kqq is a single static binary that filters, projects, and aggregates streaming
 data in one pass. It never buffers the full input, so it crunches files far
 larger than RAM with O(1) memory per group. If you can write a `WHERE` clause,
 you already know kqq.
-
-```bash
-cat logs.ndjson | kqq 'select service, count(), avg(latency_ms) group by service'
-```
 
 ## Install
 
@@ -106,10 +127,9 @@ limit 10
 
 ## Performance
 
-Single-pass streaming aggregation with O(1) memory per group. On 1M-row
-NDJSON, `group by` + `count()` + `avg()` runs in ~0.5 s using ~7 MB of RAM;
-jq needs ~8 s and ~1 GB for the same query. `limit N` without `order by`
-stops reading input the moment N matches are found.
+Single-pass streaming aggregation with O(1) memory per group. `limit N`
+without `order by` stops reading input the moment N matches are found —
+"first 5 errors in a 2 GB log" returns in milliseconds, not minutes.
 
 ## Development
 
