@@ -93,10 +93,12 @@ echo "    ✓ ruleset created (id: ${RULESET_ID})"
 
 # ── 3. Ruleset: only admins may tag v* (releases) ──────────────────────────
 echo "==> Creating ruleset 'release-tags-admin-only' for refs tags/v*"
+# NOTE: target must be "tag" — "push" rulesets do not support ref_name
+# conditions (422: "Target ref_name is not supported for push rulesets").
 gh api "repos/${REPO}/rulesets" -X POST --input - <<EOF
 {
   "name": "release-tags-admin-only",
-  "target": "push",
+  "target": "tag",
   "enforcement": "active",
   "conditions": {
     "ref_name": {
