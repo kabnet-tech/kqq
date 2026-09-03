@@ -319,5 +319,5 @@ expr       := literal | ident | ident '(' args ')' | expr binop expr
             | 'case' 'when' cond 'then' expr ('else' expr)? 'end'
 ```
 
-See [Limits](README.md#limits) in the README for what the language
+See [Limits](limits.md) in the README for what the language
 deliberately does not do.
