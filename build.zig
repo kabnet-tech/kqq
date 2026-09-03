@@ -171,7 +171,7 @@ pub fn build(b: *std.Build) void {
     // Embed version from build.zig.zon as a comptime constant so --version
     // and the build file stay in sync without manual duplication.
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", "0.7.0");
+    build_options.addOption([]const u8, "version", "0.9.0");
 
     const exe = b.addExecutable(.{
         .name = "kqq",

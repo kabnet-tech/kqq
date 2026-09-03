@@ -1,29 +1,48 @@
-# kqq
+# kqq — K-Quick-Query
 
-**SQL for streams.** A fast, single-binary query tool for NDJSON and JSON.
+**SQL for streams.** Query NDJSON, JSON, CSV, and LLM token streams with SQL —
+at memory speeds, not disk speeds.
+
+kqq is a single static binary that filters, projects, and aggregates streaming
+data in one pass. It never buffers the full input, so it crunches files far
+larger than RAM with O(1) memory per group. If you can write a `WHERE` clause,
+you already know kqq.
 
 ```bash
 cat logs.ndjson | kqq 'select service, count(), avg(latency_ms) group by service'
 ```
 
-kqq filters, projects, aggregates, and exports newline-delimited JSON using SQL
-syntax you already know. It streams — never buffering the full input — so it
-aggregates files far larger than available RAM with O(1) memory per group.
-
-## Why kqq?
-
-| Problem | jq | kqq |
-|---|---|---|
-| Group 1M rows by a field | slurps all of RAM (~1 GB) | streaming, ~7 MB |
-| "First 5 errors in a 2 GB log" | scans everything | early-stop in milliseconds |
-| CSV export | `@csv` ceremony | `--csv` flag |
-| Learning curve | functional language | SQL |
-
-kqq is **not** a jq replacement. It's purpose-built for the 80% of queries that
-are filter → project → aggregate → export. For recursive descent, custom
-functions, or Turing-complete transforms, use jq.
-
 ## Install
+
+### Download a binary (recommended)
+
+Static, zero-dependency binaries for Linux (x86_64, aarch64, ARM, RISC-V,
+POWER), macOS (Intel, Apple Silicon), Windows, and FreeBSD are on
+[GitHub Releases](https://github.com/kabnet-tech/kqq/releases).
+
+```bash
+# Linux x86_64 — v0.9.0
+curl -LO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-linux-x86_64.tar.gz
+tar xzf kqq-0.9.0-linux-x86_64.tar.gz && sudo mv kqq /usr/local/bin/
+kqq --version
+```
+
+<details>
+<summary>Other platforms</summary>
+
+```bash
+# macOS Apple Silicon
+curl -LO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-macos-aarch64.tar.gz
+tar xzf kqq-0.9.0-macos-aarch64.tar.gz && sudo mv kqq /usr/local/bin/
+
+# Windows (PowerShell) — x86_64
+# Download kqq-0.9.0-windows-x86_64.zip from Releases and add kqq.exe to PATH
+```
+
+See the [release page](https://github.com/kabnet-tech/kqq/releases) for all 15
+platforms, including FreeBSD and glibc/musl Linux variants. SHA256 checksums
+are published with every release.
+</details>
 
 ### Build from source (requires Zig 0.16.0)
 
@@ -32,19 +51,6 @@ git clone https://github.com/kabnet-tech/kqq
 cd kqq
 zig build -Doptimize=ReleaseFast
 cp zig-out/bin/kqq ~/.local/bin/    # or anywhere on $PATH
-```
-
-### Download a release binary
-
-Grab a static binary from
-[GitHub Releases](https://github.com/kabnet-tech/kqq/releases) for Linux (x86_64,
-aarch64, ARM, RISC-V, POWER), macOS (Intel, Apple Silicon), Windows, and
-FreeBSD — all zero-dependency.
-
-```bash
-# Linux x86_64 example
-curl -LO https://github.com/kabnet-tech/kqq/releases/download/v0.8.0/kqq-0.8.0-linux-x86_64.tar.gz
-tar xzf kqq-0.8.0-linux-x86_64.tar.gz && sudo mv kqq /usr/local/bin/
 ```
 
 ## Quick Start
