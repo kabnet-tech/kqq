@@ -48,39 +48,39 @@ jobs:
         include:
           # Linux — musl (fully static, recommended)
           - target: x86_64-linux-musl
-            asset: kqq-linux-x86_64
+            asset: linux-x86_64
           - target: aarch64-linux-musl
-            asset: kqq-linux-aarch64
+            asset: linux-aarch64
           - target: arm-linux-musleabihf
-            asset: kqq-linux-armv6hf
+            asset: linux-armv6hf
           - target: thumb-linux-musleabihf
-            asset: kqq-linux-armv7hf
+            asset: linux-armv7hf
           - target: x86-linux-musl
-            asset: kqq-linux-i386
+            asset: linux-i386
           - target: riscv64-linux-musl
-            asset: kqq-linux-riscv64
+            asset: linux-riscv64
           - target: powerpc64le-linux-musl
-            asset: kqq-linux-ppc64le
+            asset: linux-ppc64le
           # Linux — glibc (for distros that don't want musl)
           - target: x86_64-linux-gnu
-            asset: kqq-linux-x86_64-gnu
+            asset: linux-x86_64-gnu
           - target: aarch64-linux-gnu
-            asset: kqq-linux-aarch64-gnu
+            asset: linux-aarch64-gnu
           # macOS
           - target: x86_64-macos
-            asset: kqq-macos-x86_64
+            asset: macos-x86_64
           - target: aarch64-macos
-            asset: kqq-macos-aarch64
+            asset: macos-aarch64
           # Windows
           - target: x86_64-windows
-            asset: kqq-windows-x86_64.exe
+            asset: windows-x86_64.exe
           - target: aarch64-windows
-            asset: kqq-windows-aarch64.exe
+            asset: windows-aarch64.exe
           # BSDs
           - target: x86_64-freebsd
-            asset: kqq-freebsd-x86_64
+            asset: freebsd-x86_64
           - target: aarch64-freebsd
-            asset: kqq-freebsd-aarch64
+            asset: freebsd-aarch64
 
     steps:
       - uses: actions/checkout@v4
