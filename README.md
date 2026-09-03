@@ -57,9 +57,16 @@ you already know kqq.
 
 ### Download a binary (recommended)
 
-Static, zero-dependency binaries for Linux (x86_64, aarch64, ARM, RISC-V,
-POWER), macOS (Intel, Apple Silicon), Windows, and FreeBSD are on
-[GitHub Releases](https://github.com/kabnet-tech/kqq/releases).
+**One-line install** (Linux, macOS, FreeBSD — detects your platform, verifies
+the SHA256 checksum, installs to `/usr/local/bin` or `~/.local/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kabnet-tech/kqq/main/scripts/install.sh | sh
+```
+
+Or install manually — static, zero-dependency binaries for Linux (x86_64,
+aarch64, ARM, RISC-V, POWER), macOS (Intel, Apple Silicon), Windows, and
+FreeBSD are on [GitHub Releases](https://github.com/kabnet-tech/kqq/releases):
 
 ```bash
 # Linux x86_64 — v0.9.0
