@@ -132,10 +132,23 @@ echo "    ✓ delete_branch_on_merge, signoff, merge settings applied"
 
 # ── 5. Actions hardening ────────────────────────────────────────────────────
 echo "==> Hardening Actions"
-gh api "repos/${REPO}/actions/permissions" -X PUT -F enabled=true -F allowed_actions=selected > /dev/null
-gh api "repos/${REPO}/actions/permissions/selected-actions" -X PUT \
-  -F github_owned_allowed=true -F verified_allowed=true -F patterns_allowed='actions/checkout,actions/cache,actions/upload-artifact,actions/download-artifact,mlugg/setup-zig,softprops/action-gh-release' > /dev/null
-echo "    ✓ allowed_actions=all → selected (pinned allowlist)"
+# NOTE: Do NOT set allowed_actions=selected here. On the free plan, the
+# selected-actions policy breaks ALL workflow runs with startup_failure
+# (verified 2026-09-03: 5 consecutive CI runs failed until reverted to all).
+# Keep allowed_actions=all; the real rogue-PR protection is:
+#   1. Branch protection (PR + CI required, admins enforced) — set above
+#   2. Admin-only release gate in release.yml
+#   3. GITHUB_TOKEN is read-only (default_workflow_permissions=read)
+#   4. Fork PRs: first-time contributors need manual approval before CI runs
+#      (Settings → Actions → General → Fork pull request flows from outside
+#       collaborators → "Require approval for all outside collaborators")
+gh api "repos/${REPO}/actions/permissions/workflow" -X PUT --input - > /dev/null <<'EOF'
+{
+  "default_workflow_permissions": "read",
+  "can_approve_pull_request_reviews": false
+}
+EOF
+echo "    ✓ GITHUB_TOKEN locked to read-only, cannot approve PRs"
 
 # ── 6. Verify ───────────────────────────────────────────────────────────────
 echo "==> Verification"
