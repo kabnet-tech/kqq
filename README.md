@@ -46,6 +46,27 @@ data in one pass. It never buffers the full input, so it crunches files far
 larger than RAM with O(1) memory per group. If you can write a `WHERE` clause,
 you already know kqq.
 
+## Limits
+
+kqq is deliberately **not Turing-complete**. It's a query language, not a
+programming language — that's why it's fast and predictable. What it
+**cannot** do:
+
+- **No joins** — one input stream at a time; no cross-referencing two files
+- **No subqueries or nested selects** — a query is a single flat pipeline
+- **No user-defined functions** — the built-in function list is the whole list
+- **No variables or state between records** — each record is evaluated
+  independently (except `group by` accumulators)
+- **No recursion or loops** — `case when` is the only branching construct
+- **No window functions** — `lag`, `rank`, running totals, etc.
+- **No writes back** — output goes to stdout or a file; no in-place editing
+- **`order by` buffers** — sorting needs the full match set in memory
+  (~500 MB for 1M rows). Streaming O(1) applies to `where`/`group by`/`limit`;
+  a top-N of a huge stream is the one query that costs RAM
+
+If your problem needs any of these, it's out of kqq's lane — pipe kqq's output
+into jq, awk, or your language of choice. kqq composes well in Unix pipelines.
+
 ## Install
 
 ### Download a binary (recommended)
