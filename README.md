@@ -152,6 +152,8 @@ limit 10
   `expand`), `where`, `group by`, `having`, `order by` (aliases and ordinals),
   `limit`, `into '<file>'`
 
+📖 **Full syntax, every operator, function, and flag: [KQQ-SQL-REFERENCE.md](KQQ-SQL-REFERENCE.md)**
+
 ## Input / Output
 
 - **Input**: NDJSON (default), JSON arrays/objects, CSV, TSV (`--delim`, `--header`)
