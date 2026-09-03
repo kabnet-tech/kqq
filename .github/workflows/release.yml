@@ -139,6 +139,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set VERSION (tag name without v prefix)
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       # Admin-only gate: refuse to publish unless the tag was pushed by an
       # org owner/admin. Works on every plan; no branch protection needed.
       - name: Verify tag author is an admin
@@ -187,26 +190,26 @@ jobs:
 
             | Platform | Archive |
             |----------|--------|
-            | Linux x86_64 (musl, static) | `kqq-${{ github.ref_name }}-linux-x86_64.tar.gz` |
-            | Linux aarch64 (musl, static) | `kqq-${{ github.ref_name }}-linux-aarch64.tar.gz` |
-            | Linux ARMv6hf (musl, static) | `kqq-${{ github.ref_name }}-linux-armv6hf.tar.gz` |
-            | Linux ARMv7hf (musl, static) | `kqq-${{ github.ref_name }}-linux-armv7hf.tar.gz` |
-            | Linux i386 (musl, static) | `kqq-${{ github.ref_name }}-linux-i386.tar.gz` |
-            | Linux RISC-V 64 (musl, static) | `kqq-${{ github.ref_name }}-linux-riscv64.tar.gz` |
-            | Linux POWER9 LE (musl, static) | `kqq-${{ github.ref_name }}-linux-ppc64le.tar.gz` |
-            | Linux x86_64 (glibc) | `kqq-${{ github.ref_name }}-linux-x86_64-gnu.tar.gz` |
-            | Linux aarch64 (glibc) | `kqq-${{ github.ref_name }}-linux-aarch64-gnu.tar.gz` |
-            | macOS x86_64 | `kqq-${{ github.ref_name }}-macos-x86_64.tar.gz` |
-            | macOS Apple Silicon | `kqq-${{ github.ref_name }}-macos-aarch64.tar.gz` |
-            | Windows x86_64 | `kqq-${{ github.ref_name }}-windows-x86_64.zip` |
-            | Windows aarch64 | `kqq-${{ github.ref_name }}-windows-aarch64.zip` |
-            | FreeBSD x86_64 | `kqq-${{ github.ref_name }}-freebsd-x86_64.tar.gz` |
-            | FreeBSD aarch64 | `kqq-${{ github.ref_name }}-freebsd-aarch64.tar.gz` |
+            | Linux x86_64 (musl, static) | `kqq-${{ env.VERSION }}-linux-x86_64.tar.gz` |
+            | Linux aarch64 (musl, static) | `kqq-${{ env.VERSION }}-linux-aarch64.tar.gz` |
+            | Linux ARMv6hf (musl, static) | `kqq-${{ env.VERSION }}-linux-armv6hf.tar.gz` |
+            | Linux ARMv7hf (musl, static) | `kqq-${{ env.VERSION }}-linux-armv7hf.tar.gz` |
+            | Linux i386 (musl, static) | `kqq-${{ env.VERSION }}-linux-i386.tar.gz` |
+            | Linux RISC-V 64 (musl, static) | `kqq-${{ env.VERSION }}-linux-riscv64.tar.gz` |
+            | Linux POWER9 LE (musl, static) | `kqq-${{ env.VERSION }}-linux-ppc64le.tar.gz` |
+            | Linux x86_64 (glibc) | `kqq-${{ env.VERSION }}-linux-x86_64-gnu.tar.gz` |
+            | Linux aarch64 (glibc) | `kqq-${{ env.VERSION }}-linux-aarch64-gnu.tar.gz` |
+            | macOS x86_64 | `kqq-${{ env.VERSION }}-macos-x86_64.tar.gz` |
+            | macOS Apple Silicon | `kqq-${{ env.VERSION }}-macos-aarch64.tar.gz` |
+            | Windows x86_64 | `kqq-${{ env.VERSION }}-windows-x86_64.zip` |
+            | Windows aarch64 | `kqq-${{ env.VERSION }}-windows-aarch64.zip` |
+            | FreeBSD x86_64 | `kqq-${{ env.VERSION }}-freebsd-x86_64.tar.gz` |
+            | FreeBSD aarch64 | `kqq-${{ env.VERSION }}-freebsd-aarch64.tar.gz` |
 
             ### Verify download integrity
 
             ```bash
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
+            curl -fLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
             sha256sum -c checksums.txt --ignore-missing
             ```
 
@@ -214,10 +217,10 @@ jobs:
 
             ```bash
             # Linux x86_64
-            curl -Lo kqq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kqq-${{ github.ref_name }}-linux-x86_64.tar.gz
+            curl -fLo kqq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kqq-${{ env.VERSION }}-linux-x86_64.tar.gz
             tar xzf kqq.tar.gz && chmod +x kqq && sudo mv kqq /usr/local/bin/
 
             # macOS Apple Silicon
-            curl -Lo kqq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kqq-${{ github.ref_name }}-macos-aarch64.tar.gz
+            curl -fLo kqq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kqq-${{ env.VERSION }}-macos-aarch64.tar.gz
             tar xzf kqq.tar.gz && chmod +x kqq && sudo mv kqq /usr/local/bin/
             ```

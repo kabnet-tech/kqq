@@ -1,5 +1,12 @@
 # kqq — K-Quick-Query
 
+[![CI](https://github.com/kabnet-tech/kqq/actions/workflows/ci.yml/badge.svg)](https://github.com/kabnet-tech/kqq/actions/workflows/ci.yml)
+[![Release](https://github.com/kabnet-tech/kqq/actions/workflows/release.yml/badge.svg)](https://github.com/kabnet-tech/kqq/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/kabnet-tech/kqq?logo=github)](https://github.com/kabnet-tech/kqq/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows%20%7C%20FreeBSD-lightgrey)
+![Zig](https://img.shields.io/badge/zig-0.16.0-orange)
+
 **SQL for streams.** Query NDJSON, JSON, CSV, and LLM token streams with SQL —
 at memory speeds, not disk speeds.
 
@@ -81,13 +88,6 @@ curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-
 tar xzf kqq-0.9.0-linux-x86_64.tar.gz && sudo mv kqq /usr/local/bin/
 kqq --version
 ```
-
-> **`tar: not in gzip format`?** The download failed — `curl -O` saves GitHub's
-> "Not Found" page even on a 404. The `-f` flag above makes curl fail instead.
-> Check the exact asset name on the
-> [release page](https://github.com/kabnet-tech/kqq/releases) — names are
-> `kqq-<version>-<platform>.tar.gz` (e.g. `kqq-0.9.0-linux-x86_64.tar.gz`).
-> Windows assets are `.zip` — use `unzip`, not `tar`.
 
 <details>
 <summary>Other platforms</summary>
