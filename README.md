@@ -1,4 +1,4 @@
-# kqq — K-Quick-Query
+# kqq — K-Quick-Query | SQL for streams
 
 [![CI](https://github.com/kabnet-tech/kqq/actions/workflows/ci.yml/badge.svg)](https://github.com/kabnet-tech/kqq/actions/workflows/ci.yml)
 [![Release](https://github.com/kabnet-tech/kqq/actions/workflows/release.yml/badge.svg)](https://github.com/kabnet-tech/kqq/actions/workflows/release.yml)
