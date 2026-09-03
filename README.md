@@ -13,9 +13,14 @@ Same query — group 1M rows by a field and compute `count()` + `avg()` — on t
 same machine. **Run it yourself:**
 
 ```bash
-N=1000000; DATA=$(mktemp); python3 -c "import json,random
-random.seed(42)
-[print(json.dumps({'service': f'svc-{i%50}', 'latency_ms': random.randint(1,100)})) for i in range($N)]" > "$DATA"; S=$(date +%s%N); kqq 'select service, count(), avg(latency_ms) group by service' < "$DATA" > /dev/null; E=$(date +%s%N); echo "kqq: $(( (E-S)/1000000 )) ms"; S=$(date +%s%N); jq -s 'group_by(.service) | map({service: .[0].service, count: length, avg: (map(.latency_ms) | add / length)})' < "$DATA" > /dev/null; E=$(date +%s%N); echo "jq: $(( (E-S)/1000000 )) ms"; rm -f "$DATA"
+# 1. Generate 1M rows
+python3 -c "import json,random; random.seed(42); [print(json.dumps({'service': f'svc-{i%50}', 'latency_ms': random.randint(1,100)})) for i in range(1000000)]" > /tmp/bench.ndjson
+
+# 2. Time kqq
+time kqq 'select service, count(), avg(latency_ms) group by service' < /tmp/bench.ndjson > /dev/null
+
+# 3. Time jq
+time jq -s 'group_by(.service) | map({service: .[0].service, count: length, avg: (map(.latency_ms) | add / length)})' < /tmp/bench.ndjson > /dev/null
 ```
 
 Measured on this repo's dev machine (jq 1.8.2, kqq 0.9.0 ReleaseFast):
