@@ -139,6 +139,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Admin-only gate: refuse to publish unless the tag was pushed by an
+      # org owner/admin. Works on every plan; no branch protection needed.
+      - name: Verify tag author is an admin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ACTOR="${{ github.actor }}"
+          ROLE=$(gh api "repos/${{ github.repository }}/collaborators/${ACTOR}/permission" --jq '.role_name')
+          echo "Tag pushed by: ${ACTOR} (role: ${ROLE})"
+          if [[ "${ROLE}" != "admin" ]]; then
+            echo "::error::Releases may only be published by repository admins. '${ACTOR}' has role '${ROLE}'."
+            exit 1
+          fi
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
