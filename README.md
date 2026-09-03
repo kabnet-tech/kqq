@@ -1,4 +1,4 @@
-# K-Quick-Query | stream | kqq 'select *'
+# K-Quick-Query (kqq) — SQL for Streams
 
 [![CI](https://github.com/kabnet-tech/kqq/actions/workflows/ci.yml/badge.svg)](https://github.com/kabnet-tech/kqq/actions/workflows/ci.yml)
 [![Release](https://github.com/kabnet-tech/kqq/actions/workflows/release.yml/badge.svg)](https://github.com/kabnet-tech/kqq/actions/workflows/release.yml)
@@ -140,10 +140,10 @@ curl -s localhost:11434/api/generate -d '{...}' | kqq --api ollama 'select name,
 ## Query Language
 
 ```sql
-select dept, count(), avg(salary) as avg_sal
+select dept, count() as n, avg(salary) as avg_sal
 where active = true
 group by dept
-having count() > 2
+having n > 2
 order by avg_sal desc
 limit 10
 ```
