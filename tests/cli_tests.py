@@ -110,13 +110,13 @@ check("--version flag",
       args=["--version"],
       stdin=b"",
       expect_exit=0,
-      stdout_contains="kqq 0.7.0")
+      stdout_contains="kqq 0.9.0")
 
 check("-V short flag",
       args=["-V"],
       stdin=b"",
       expect_exit=0,
-      stdout_contains="kqq 0.7.0")
+      stdout_contains="kqq 0.9.0")
 
 check("--help flag",
       args=["--help"],
