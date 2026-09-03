@@ -10,12 +10,20 @@ cat logs.ndjson | kqq 'select service, count(), avg(latency_ms) group by service
 ## jq vs kqq
 
 Same query — group 1M rows by a field and compute `count()` + `avg()` — on the
-same machine:
+same machine. **Run it yourself:**
+
+```bash
+N=1000000; DATA=$(mktemp); python3 -c "import json,random
+random.seed(42)
+[print(json.dumps({'service': f'svc-{i%50}', 'latency_ms': random.randint(1,100)})) for i in range($N)]" > "$DATA"; S=$(date +%s%N); kqq 'select service, count(), avg(latency_ms) group by service' < "$DATA" > /dev/null; E=$(date +%s%N); echo "kqq: $(( (E-S)/1000000 )) ms"; S=$(date +%s%N); jq -s 'group_by(.service) | map({service: .[0].service, count: length, avg: (map(.latency_ms) | add / length)})' < "$DATA" > /dev/null; E=$(date +%s%N); echo "jq: $(( (E-S)/1000000 )) ms"; rm -f "$DATA"
+```
+
+Measured on this repo's dev machine (jq 1.8.2, kqq 0.9.0 ReleaseFast):
 
 | Metric | jq | kqq | |
 |---|---|---|---|
-| Time | ~8 s | ~0.5 s | **16× faster** |
-| Peak memory | ~1 GB | ~7 MB | **150× less** |
+| Time | ~7.7 s | ~0.27 s | **~28× faster** |
+| Peak memory | ~690 MB | ~1 MB | **~700× less** |
 | Input size | buffers everything | streams, O(1) per group | |
 
 | Problem | jq | kqq |
