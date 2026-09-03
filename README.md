@@ -53,27 +53,6 @@ data in one pass. It never buffers the full input, so it crunches files far
 larger than RAM with O(1) memory per group. If you can write a `WHERE` clause,
 you already know kqq.
 
-## Limits
-
-kqq is deliberately **not Turing-complete**. It's a query language, not a
-programming language — that's why it's fast and predictable. What it
-**cannot** do:
-
-- **No joins** — one input stream at a time; no cross-referencing two files
-- **No subqueries or nested selects** — a query is a single flat pipeline
-- **No user-defined functions** — the built-in function list is the whole list
-- **No variables or state between records** — each record is evaluated
-  independently (except `group by` accumulators)
-- **No recursion or loops** — `case when` is the only branching construct
-- **No window functions** — `lag`, `rank`, running totals, etc.
-- **No writes back** — output goes to stdout or a file; no in-place editing
-- **`order by` buffers** — sorting needs the full match set in memory
-  (~500 MB for 1M rows). Streaming O(1) applies to `where`/`group by`/`limit`;
-  a top-N of a huge stream is the one query that costs RAM
-
-If your problem needs any of these, it's out of kqq's lane — pipe kqq's output
-into jq, awk, or your language of choice. kqq composes well in Unix pipelines.
-
 ## Install
 
 ### Download a binary (recommended)
@@ -137,42 +116,27 @@ cat events.ndjson | kqq 'where level = "ERROR"' --reject clean.ndjson > errors.n
 curl -s localhost:11434/api/generate -d '{...}' | kqq --api ollama 'select name, price where price < 100' --csv
 ```
 
-## Query Language
+## kqq + DuckDB
 
-```sql
-select dept, count() as n, avg(salary) as avg_sal
-where active = true
-group by dept
-having n > 2
-order by avg_sal desc
-limit 10
+kqq is the gate, DuckDB is the brain: kqq streams and shrinks the input with
+O(1) memory, DuckDB does the heavy relational analytics on what's left.
+
+```bash
+# Pre-filter a huge stream, then analyze — DuckDB never sees the 99.9% you don't want
+cat 2M-rows.ndjson | kqq 'select service, latency_ms where status = "error"' --ndjson \
+  | duckdb -c "SELECT service, avg(latency_ms) FROM read_json_auto('/dev/stdin') GROUP BY service;"
 ```
 
-- **Operators**: `= != > < >= <= like contains starts_with ends_with in
-  not in is null is not null has() matches` (regex), `between [lo and hi]`
-- **Functions**: `upper lower len trim concat substr replace lpad rpad split
-  round floor ceil abs to_number format coalesce isnull ifhas type_of keys
-  values to_entries date_part epoch_*` and more
-- **Expressions**: arithmetic (`salary * 0.1`), `case when ... then ... end`,
-  `--arg name value` variable injection
-- **Clauses**: `select` (with `as` aliases, `* add`, `* remove`, `distinct`,
-  `expand`), `where`, `group by`, `having`, `order by` (aliases and ordinals),
-  `limit`, `into '<file>'`
+Filter to NDJSON, aggregate to CSV, or pipe straight through `/dev/stdin` —
+six verified patterns in **[docs/duckdb.md](docs/duckdb.md)**.
 
-📖 **Full syntax, every operator, function, and flag: [KQQ-SQL-REFERENCE.md](KQQ-SQL-REFERENCE.md)**
+## Documentation
 
-## Input / Output
-
-- **Input**: NDJSON (default), JSON arrays/objects, CSV, TSV (`--delim`, `--header`)
-- **Output**: JSON (default), NDJSON (`--ndjson`), CSV (`--csv`), TSV (`--tsv`), raw (`--raw`)
-- **Streaming**: aggregate queries emit once at end of stream (SQL semantics);
-  non-aggregate queries emit per record with true early-stop on `limit`
-
-## Performance
-
-Single-pass streaming aggregation with O(1) memory per group. `limit N`
-without `order by` stops reading input the moment N matches are found —
-"first 5 errors in a 2 GB log" returns in milliseconds, not minutes.
+| Doc | Contents |
+|---|---|
+| [docs/KQQ-SQL-REFERENCE.md](docs/KQQ-SQL-REFERENCE.md) | Every operator, function, clause, and CLI flag — with verified examples |
+| [docs/duckdb.md](docs/duckdb.md) | kqq → DuckDB integration patterns |
+| [docs/limits.md](docs/limits.md) | What kqq deliberately does not do (not Turing-complete) |
 
 ## Development
 
