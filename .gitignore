@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+dist/
+*.o
+*.pdb
+result
+result-*
+.direnv/
+*.swp
+.DS_Store

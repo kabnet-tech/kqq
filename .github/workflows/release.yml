@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  # Run full test suite before building release artifacts
+  test:
+    name: Test before release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-ubuntu-latest-${{ hashFiles('build.zig.zon') }}-${{ hashFiles('src/**') }}
+          restore-keys: |
+            zig-ubuntu-latest-${{ hashFiles('build.zig.zon') }}-
+            zig-ubuntu-latest-
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run Zig unit tests
+        run: zig build test --summary all
+
+      - name: Run CLI tests
+        run: python3 tests/cli_tests.py
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux — musl (fully static, recommended)
+          - target: x86_64-linux-musl
+            asset: kq-linux-x86_64
+          - target: aarch64-linux-musl
+            asset: kq-linux-aarch64
+          - target: arm-linux-musleabihf
+            asset: kq-linux-armv6hf
+          - target: thumb-linux-musleabihf
+            asset: kq-linux-armv7hf
+          - target: x86-linux-musl
+            asset: kq-linux-i386
+          - target: riscv64-linux-musl
+            asset: kq-linux-riscv64
+          - target: powerpc64le-linux-musl
+            asset: kq-linux-ppc64le
+          # Linux — glibc (for distros that don't want musl)
+          - target: x86_64-linux-gnu
+            asset: kq-linux-x86_64-gnu
+          - target: aarch64-linux-gnu
+            asset: kq-linux-aarch64-gnu
+          # macOS
+          - target: x86_64-macos
+            asset: kq-macos-x86_64
+          - target: aarch64-macos
+            asset: kq-macos-aarch64
+          # Windows
+          - target: x86_64-windows
+            asset: kq-windows-x86_64.exe
+          - target: aarch64-windows
+            asset: kq-windows-aarch64.exe
+          # BSDs
+          - target: x86_64-freebsd
+            asset: kq-freebsd-x86_64
+          - target: aarch64-freebsd
+            asset: kq-freebsd-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-release-${{ matrix.target }}-${{ hashFiles('build.zig.zon') }}-${{ hashFiles('src/**') }}
+          restore-keys: |
+            zig-release-${{ matrix.target }}-${{ hashFiles('build.zig.zon') }}-
+            zig-release-${{ matrix.target }}-
+
+      - name: Build
+        run: |
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+          # Strip native x86_64 Linux binaries (smaller release)
+          if [[ "${{ matrix.target }}" == "x86_64-linux-musl" || "${{ matrix.target }}" == "x86_64-linux-gnu" ]]; then
+            strip zig-out/bin/kq 2>/dev/null || true
+          fi
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            ARCHIVE="kq-${VERSION}-${{ matrix.asset }}.zip"
+            cd zig-out/bin && zip -q "../../$ARCHIVE" kq.exe
+          else
+            ARCHIVE="kq-${VERSION}-${{ matrix.asset }}.tar.gz"
+            tar -C zig-out/bin -czf "$ARCHIVE" kq
+          fi
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Show archive size
+        run: ls -lh "$ARCHIVE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: kq-*-${{ matrix.asset }}.*
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Show artifacts
+        run: ls -lh artifacts/
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum kq-* > checksums.txt
+          sha256sum checksums.txt > checksums.txt.sha256
+          echo "=== checksums.txt ==="
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/kq-*
+            artifacts/checksums.txt
+            artifacts/checksums.txt.sha256
+          generate_release_notes: true
+          body: |
+            ## kq ${{ github.ref_name }}
+
+            Fast SQL-like NDJSON query tool. Single static binary, zero dependencies.
+
+            ### Download
+
+            | Platform | Archive |
+            |----------|--------|
+            | Linux x86_64 (musl, static) | `kq-${{ github.ref_name }}-linux-x86_64.tar.gz` |
+            | Linux aarch64 (musl, static) | `kq-${{ github.ref_name }}-linux-aarch64.tar.gz` |
+            | Linux ARMv6hf (musl, static) | `kq-${{ github.ref_name }}-linux-armv6hf.tar.gz` |
+            | Linux ARMv7hf (musl, static) | `kq-${{ github.ref_name }}-linux-armv7hf.tar.gz` |
+            | Linux i386 (musl, static) | `kq-${{ github.ref_name }}-linux-i386.tar.gz` |
+            | Linux RISC-V 64 (musl, static) | `kq-${{ github.ref_name }}-linux-riscv64.tar.gz` |
+            | Linux POWER9 LE (musl, static) | `kq-${{ github.ref_name }}-linux-ppc64le.tar.gz` |
+            | Linux x86_64 (glibc) | `kq-${{ github.ref_name }}-linux-x86_64-gnu.tar.gz` |
+            | Linux aarch64 (glibc) | `kq-${{ github.ref_name }}-linux-aarch64-gnu.tar.gz` |
+            | macOS x86_64 | `kq-${{ github.ref_name }}-macos-x86_64.tar.gz` |
+            | macOS Apple Silicon | `kq-${{ github.ref_name }}-macos-aarch64.tar.gz` |
+            | Windows x86_64 | `kq-${{ github.ref_name }}-windows-x86_64.zip` |
+            | Windows aarch64 | `kq-${{ github.ref_name }}-windows-aarch64.zip` |
+            | FreeBSD x86_64 | `kq-${{ github.ref_name }}-freebsd-x86_64.tar.gz` |
+            | FreeBSD aarch64 | `kq-${{ github.ref_name }}-freebsd-aarch64.tar.gz` |
+
+            ### Verify download integrity
+
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
+            sha256sum -c checksums.txt --ignore-missing
+            ```
+
+            ### Quick install (Linux/macOS)
+
+            ```bash
+            # Linux x86_64
+            curl -Lo kq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kq-${{ github.ref_name }}-linux-x86_64.tar.gz
+            tar xzf kq.tar.gz && chmod +x kq && sudo mv kq /usr/local/bin/
+
+            # macOS Apple Silicon
+            curl -Lo kq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kq-${{ github.ref_name }}-macos-aarch64.tar.gz
+            tar xzf kq.tar.gz && chmod +x kq && sudo mv kq /usr/local/bin/
+            ```

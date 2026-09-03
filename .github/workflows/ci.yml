@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Native tests (Linux + macOS) ─────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-${{ matrix.os }}-${{ hashFiles('build.zig.zon') }}-${{ hashFiles('src/**') }}
+          restore-keys: |
+            zig-${{ matrix.os }}-${{ hashFiles('build.zig.zon') }}-
+            zig-${{ matrix.os }}-
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run Zig unit tests
+        run: zig build test --summary all
+
+      - name: Run CLI tests
+        run: python3 tests/cli_tests.py
+
+      - name: Smoke test binary
+        run: |
+          echo '{"name":"Alice","score":98}' | ./zig-out/bin/kq 'where score > 90'
+          echo '{"name":"Bob","score":50}' | ./zig-out/bin/kq 'select name, score // 0 as score'
+          ./zig-out/bin/kq --version
+
+  # ── Cross-compilation check (all supported targets) ───────────────────────
+  # Verifies the code compiles for every target from a single Ubuntu runner.
+  # Does not run tests (no emulator) — just confirms no target-specific build failures.
+  cross-compile:
+    name: Cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Linux — musl (fully static, no glibc dependency)
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - arm-linux-musleabihf      # 32-bit ARM (Raspberry Pi 2/3)
+          - thumb-linux-musleabihf    # ARMv7 (Zig uses thumb triple for armv7)
+          - x86-linux-musl            # 32-bit x86 (Zig uses x86 triple for i386)
+          - riscv64-linux-musl        # RISC-V 64
+          - powerpc64le-linux-musl    # POWER / IBM
+          - mips-linux-musl           # MIPS (routers, embedded)
+          - mipsel-linux-musl         # MIPS little-endian
+          # Linux — glibc (for distros that prefer dynamic linking)
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          # macOS
+          - x86_64-macos
+          - aarch64-macos
+          # Windows
+          - x86_64-windows
+          - aarch64-windows
+          # BSDs
+          - x86_64-freebsd
+          - aarch64-freebsd
+          # WebAssembly
+          - wasm32-wasi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-cross-${{ matrix.target }}-${{ hashFiles('build.zig.zon') }}-${{ hashFiles('src/**') }}
+          restore-keys: |
+            zig-cross-${{ matrix.target }}-${{ hashFiles('build.zig.zon') }}-
+            zig-cross-${{ matrix.target }}-
+
+      - name: Cross-compile
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Show binary size
+        run: |
+          if compgen -G "zig-out/bin/kq*" > /dev/null; then
+            ls -lh zig-out/bin/kq*
+          fi

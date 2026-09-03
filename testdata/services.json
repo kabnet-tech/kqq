@@ -1,0 +1,124 @@
+{
+    "services": [
+        {
+            "id": "svc-001",
+            "name": "auth-service",
+            "status": "running",
+            "region": "us-east-1",
+            "replicas": 3,
+            "cpu_pct": 12.4,
+            "mem_mb": 512,
+            "version": "2.1.0",
+            "owner": "platform",
+            "critical": true
+        },
+        {
+            "id": "svc-002",
+            "name": "user-api",
+            "status": "running",
+            "region": "us-east-1",
+            "replicas": 5,
+            "cpu_pct": 34.7,
+            "mem_mb": 1024,
+            "version": "1.9.3",
+            "owner": "backend",
+            "critical": true
+        },
+        {
+            "id": "svc-003",
+            "name": "email-worker",
+            "status": "stopped",
+            "region": "us-west-2",
+            "replicas": 0,
+            "cpu_pct": 0.0,
+            "mem_mb": 0,
+            "version": "1.2.1",
+            "owner": "backend",
+            "critical": false
+        },
+        {
+            "id": "svc-004",
+            "name": "image-processor",
+            "status": "running",
+            "region": "eu-west-1",
+            "replicas": 2,
+            "cpu_pct": 78.9,
+            "mem_mb": 2048,
+            "version": "3.0.0",
+            "owner": "media",
+            "critical": false
+        },
+        {
+            "id": "svc-005",
+            "name": "payments-api",
+            "status": "running",
+            "region": "us-east-1",
+            "replicas": 4,
+            "cpu_pct": 22.1,
+            "mem_mb": 768,
+            "version": "4.5.2",
+            "owner": "finance",
+            "critical": true
+        },
+        {
+            "id": "svc-006",
+            "name": "analytics-ingress",
+            "status": "degraded",
+            "region": "us-east-1",
+            "replicas": 3,
+            "cpu_pct": 91.3,
+            "mem_mb": 4096,
+            "version": "2.0.1",
+            "owner": "data",
+            "critical": false
+        },
+        {
+            "id": "svc-007",
+            "name": "search-api",
+            "status": "running",
+            "region": "ap-south-1",
+            "replicas": 6,
+            "cpu_pct": 45.0,
+            "mem_mb": 1536,
+            "version": "1.1.0",
+            "owner": "search",
+            "critical": true
+        },
+        {
+            "id": "svc-008",
+            "name": "notification-svc",
+            "status": "running",
+            "region": "eu-west-1",
+            "replicas": 2,
+            "cpu_pct": 8.3,
+            "mem_mb": 256,
+            "version": "1.0.5",
+            "owner": "platform",
+            "critical": false
+        },
+        {
+            "id": "svc-009",
+            "name": "cdn-purge-worker",
+            "status": "stopped",
+            "region": "us-west-2",
+            "replicas": 0,
+            "cpu_pct": 0.0,
+            "mem_mb": 0,
+            "version": "0.9.0",
+            "owner": "infra",
+            "critical": false
+        },
+        {
+            "id": "svc-010",
+            "name": "billing-service",
+            "status": "running",
+            "region": "us-east-1",
+            "replicas": 3,
+            "cpu_pct": 15.6,
+            "mem_mb": 640,
+            "version": "3.2.1",
+            "owner": "finance",
+            "critical": true
+        }
+    ]
+}

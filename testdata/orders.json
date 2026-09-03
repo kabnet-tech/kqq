@@ -1,0 +1,124 @@
+{
+    "orders": [
+        {
+            "id": "ord-001",
+            "customer": "Alice",
+            "product": "Laptop",
+            "category": "electronics",
+            "qty": 1,
+            "unit_price": 1299.99,
+            "status": "shipped",
+            "warehouse": "US-EAST",
+            "priority": "high",
+            "discount_pct": 5
+        },
+        {
+            "id": "ord-002",
+            "customer": "Bob",
+            "product": "Desk Chair",
+            "category": "furniture",
+            "qty": 2,
+            "unit_price": 349.00,
+            "status": "pending",
+            "warehouse": "US-WEST",
+            "priority": "normal",
+            "discount_pct": 0
+        },
+        {
+            "id": "ord-003",
+            "customer": "Carol",
+            "product": "Monitor",
+            "category": "electronics",
+            "qty": 2,
+            "unit_price": 499.50,
+            "status": "delivered",
+            "warehouse": "EU-WEST",
+            "priority": "normal",
+            "discount_pct": 10
+        },
+        {
+            "id": "ord-004",
+            "customer": "Dave",
+            "product": "Keyboard",
+            "category": "electronics",
+            "qty": 3,
+            "unit_price": 89.99,
+            "status": "pending",
+            "warehouse": "US-EAST",
+            "priority": "low",
+            "discount_pct": 0
+        },
+        {
+            "id": "ord-005",
+            "customer": "Eve",
+            "product": "Standing Desk",
+            "category": "furniture",
+            "qty": 1,
+            "unit_price": 799.00,
+            "status": "shipped",
+            "warehouse": "US-EAST",
+            "priority": "high",
+            "discount_pct": 15
+        },
+        {
+            "id": "ord-006",
+            "customer": "Frank",
+            "product": "Webcam",
+            "category": "electronics",
+            "qty": 1,
+            "unit_price": 79.00,
+            "status": "cancelled",
+            "warehouse": "EU-WEST",
+            "priority": "low",
+            "discount_pct": 0
+        },
+        {
+            "id": "ord-007",
+            "customer": "Grace",
+            "product": "Headphones",
+            "category": "electronics",
+            "qty": 4,
+            "unit_price": 249.00,
+            "status": "delivered",
+            "warehouse": "AP-SOUTH",
+            "priority": "normal",
+            "discount_pct": 5
+        },
+        {
+            "id": "ord-008",
+            "customer": "Hank",
+            "product": "Bookshelf",
+            "category": "furniture",
+            "qty": 1,
+            "unit_price": 189.00,
+            "status": "pending",
+            "warehouse": "US-WEST",
+            "priority": "low",
+            "discount_pct": 0
+        },
+        {
+            "id": "ord-009",
+            "customer": "Iris",
+            "product": "Laptop",
+            "category": "electronics",
+            "qty": 1,
+            "unit_price": 1299.99,
+            "status": "shipped",
+            "warehouse": "AP-SOUTH",
+            "priority": "high",
+            "discount_pct": 0
+        },
+        {
+            "id": "ord-010",
+            "customer": "Jack",
+            "product": "Mouse",
+            "category": "electronics",
+            "qty": 5,
+            "unit_price": 39.99,
+            "status": "delivered",
+            "warehouse": "US-EAST",
+            "priority": "low",
+            "discount_pct": 0
+        }
+    ]
+}

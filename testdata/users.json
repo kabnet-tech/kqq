@@ -1,0 +1,158 @@
+{
+    "users": [
+        {
+            "id": 1,
+            "name": "Alice",
+            "age": 31,
+            "role": "admin",
+            "active": true,
+            "score": 98.5,
+            "address": {
+                "city": "Austin",
+                "country": "US"
+            },
+            "tags": [
+                "admin",
+                "superuser"
+            ]
+        },
+        {
+            "id": 2,
+            "name": "Bob",
+            "age": 24,
+            "role": "user",
+            "active": true,
+            "score": 72.1,
+            "address": {
+                "city": "Boston",
+                "country": "US"
+            },
+            "tags": [
+                "user"
+            ]
+        },
+        {
+            "id": 3,
+            "name": "Carol",
+            "age": 41,
+            "role": "user",
+            "active": false,
+            "score": 55.0,
+            "address": {
+                "city": "London",
+                "country": "UK"
+            },
+            "tags": [
+                "user",
+                "beta"
+            ]
+        },
+        {
+            "id": 4,
+            "name": "Dave",
+            "age": 19,
+            "role": "guest",
+            "active": true,
+            "score": 30.0,
+            "address": {
+                "city": "Berlin",
+                "country": "DE"
+            },
+            "tags": [
+                "guest"
+            ]
+        },
+        {
+            "id": 5,
+            "name": "Eve",
+            "age": 36,
+            "role": "admin",
+            "active": true,
+            "score": 91.3,
+            "address": {
+                "city": "Austin",
+                "country": "US"
+            },
+            "tags": [
+                "admin"
+            ]
+        },
+        {
+            "id": 6,
+            "name": "Frank",
+            "age": 28,
+            "role": "user",
+            "active": false,
+            "score": 60.7,
+            "address": {
+                "city": "Paris",
+                "country": "FR"
+            },
+            "tags": [
+                "user",
+                "beta"
+            ]
+        },
+        {
+            "id": 7,
+            "name": "Grace",
+            "age": 45,
+            "role": "admin",
+            "active": true,
+            "score": 87.9,
+            "address": {
+                "city": "Sydney",
+                "country": "AU"
+            },
+            "tags": [
+                "admin"
+            ]
+        },
+        {
+            "id": 8,
+            "name": "Hank",
+            "age": 22,
+            "role": "user",
+            "active": true,
+            "score": 44.2,
+            "address": {
+                "city": "Toronto",
+                "country": "CA"
+            },
+            "tags": [
+                "user"
+            ]
+        },
+        {
+            "id": 9,
+            "name": "Iris",
+            "age": 33,
+            "role": "user",
+            "active": true,
+            "score": 78.6,
+            "address": {
+                "city": "Tokyo",
+                "country": "JP"
+            },
+            "tags": [
+                "user",
+                "beta"
+            ]
+        },
+        {
+            "id": 10,
+            "name": "Jack",
+            "age": 50,
+            "role": "guest",
+            "active": false,
+            "score": 20.0,
+            "address": {
+                "city": "New York",
+                "country": "US"
+            },
+            "tags": [
+                "guest"
+            ]
+        }
+    ]
+}
