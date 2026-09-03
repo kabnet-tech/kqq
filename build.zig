@@ -28,126 +28,126 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("zig_kq", .{
+    const mod = b.addModule("zig_kqq", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
 
-    const regex_mod = b.addModule("kq_regex", .{
+    const regex_mod = b.addModule("kqq_regex", .{
         .root_source_file = b.path("src/core/regex.zig"),
         .target = target,
     });
 
-    const ast_mod = b.addModule("kq_ast", .{
+    const ast_mod = b.addModule("kqq_ast", .{
         .root_source_file = b.path("src/query/ast.zig"),
         .target = target,
     });
 
-    const tokenizer_mod = b.addModule("kq_tokenizer", .{
+    const tokenizer_mod = b.addModule("kqq_tokenizer", .{
         .root_source_file = b.path("src/query/tokenizer.zig"),
         .target = target,
     });
 
-    const query_mod = b.addModule("kq_query", .{
+    const query_mod = b.addModule("kqq_query", .{
         .root_source_file = b.path("src/query.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_regex", .module = regex_mod },
-            .{ .name = "kq_ast", .module = ast_mod },
-            .{ .name = "kq_tokenizer", .module = tokenizer_mod },
+            .{ .name = "kqq_regex", .module = regex_mod },
+            .{ .name = "kqq_ast", .module = ast_mod },
+            .{ .name = "kqq_tokenizer", .module = tokenizer_mod },
         },
     });
 
-    const record_mod = b.addModule("kq_record", .{
+    const record_mod = b.addModule("kqq_record", .{
         .root_source_file = b.path("src/core/record.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_query", .module = query_mod },
+            .{ .name = "kqq_query", .module = query_mod },
         },
     });
 
     // expr.zig and where.zig have a circular dependency (expr calls
     // recordPassesWhere for CASE WHEN, where calls evalExpr for computed LHS).
     // Create both modules first, then wire imports via addImport.
-    const expr_mod = b.addModule("kq_expr", .{
+    const expr_mod = b.addModule("kqq_expr", .{
         .root_source_file = b.path("src/core/expr.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_query", .module = query_mod },
-            .{ .name = "kq_record", .module = record_mod },
+            .{ .name = "kqq_query", .module = query_mod },
+            .{ .name = "kqq_record", .module = record_mod },
         },
     });
 
-    const where_mod = b.addModule("kq_where", .{
+    const where_mod = b.addModule("kqq_where", .{
         .root_source_file = b.path("src/core/where.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_query", .module = query_mod },
-            .{ .name = "kq_regex", .module = regex_mod },
-            .{ .name = "kq_record", .module = record_mod },
-            .{ .name = "kq_expr", .module = expr_mod },
+            .{ .name = "kqq_query", .module = query_mod },
+            .{ .name = "kqq_regex", .module = regex_mod },
+            .{ .name = "kqq_record", .module = record_mod },
+            .{ .name = "kqq_expr", .module = expr_mod },
         },
     });
 
     // Now add the circular import: expr needs where for CASE WHEN
-    expr_mod.addImport("kq_where", where_mod);
+    expr_mod.addImport("kqq_where", where_mod);
 
-    const output_mod = b.addModule("kq_output", .{
+    const output_mod = b.addModule("kqq_output", .{
         .root_source_file = b.path("src/core/output.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_record", .module = record_mod },
+            .{ .name = "kqq_record", .module = record_mod },
         },
     });
 
-    const raw_where_mod = b.addModule("kq_raw_where", .{
+    const raw_where_mod = b.addModule("kqq_raw_where", .{
         .root_source_file = b.path("src/core/raw_where.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_query", .module = query_mod },
+            .{ .name = "kqq_query", .module = query_mod },
         },
     });
 
-    const llm_mod = b.addModule("kq_llm", .{
+    const llm_mod = b.addModule("kqq_llm", .{
         .root_source_file = b.path("src/exec/llm.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_query", .module = query_mod },
-            .{ .name = "kq_record", .module = record_mod },
-            .{ .name = "kq_output", .module = output_mod },
+            .{ .name = "kqq_query", .module = query_mod },
+            .{ .name = "kqq_record", .module = record_mod },
+            .{ .name = "kqq_output", .module = output_mod },
         },
     });
 
-    const stream_mod = b.addModule("kq_stream", .{
+    const stream_mod = b.addModule("kqq_stream", .{
         .root_source_file = b.path("src/stream.zig"),
         .target = target,
     });
 
-    const stream_exec_mod = b.addModule("kq_stream_exec", .{
+    const stream_exec_mod = b.addModule("kqq_stream_exec", .{
         .root_source_file = b.path("src/stream_exec.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_query", .module = query_mod },
-            .{ .name = "kq_stream", .module = stream_mod },
-            .{ .name = "kq_regex", .module = regex_mod },
-            .{ .name = "kq_record", .module = record_mod },
-            .{ .name = "kq_expr", .module = expr_mod },
-            .{ .name = "kq_where", .module = where_mod },
-            .{ .name = "kq_output", .module = output_mod },
-            .{ .name = "kq_llm", .module = llm_mod },
-            .{ .name = "kq_raw_where", .module = raw_where_mod },
+            .{ .name = "kqq_query", .module = query_mod },
+            .{ .name = "kqq_stream", .module = stream_mod },
+            .{ .name = "kqq_regex", .module = regex_mod },
+            .{ .name = "kqq_record", .module = record_mod },
+            .{ .name = "kqq_expr", .module = expr_mod },
+            .{ .name = "kqq_where", .module = where_mod },
+            .{ .name = "kqq_output", .module = output_mod },
+            .{ .name = "kqq_llm", .module = llm_mod },
+            .{ .name = "kqq_raw_where", .module = raw_where_mod },
         },
     });
 
-    const record_source_mod = b.addModule("kq_record_source", .{
+    const record_source_mod = b.addModule("kqq_record_source", .{
         .root_source_file = b.path("src/record_source.zig"),
         .target = target,
         .imports = &.{
-            .{ .name = "kq_stream_exec", .module = stream_exec_mod },
+            .{ .name = "kqq_stream_exec", .module = stream_exec_mod },
         },
     });
 
-    const writers_mod = b.addModule("kq_writers", .{
+    const writers_mod = b.addModule("kqq_writers", .{
         .root_source_file = b.path("src/cli/writers.zig"),
         .target = target,
     });
@@ -174,7 +174,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", "0.7.0");
 
     const exe = b.addExecutable(.{
-        .name = "kq",
+        .name = "kqq",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -189,13 +189,13 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                .{ .name = "kq", .module = mod },
-                .{ .name = "kq_query", .module = query_mod },
-                .{ .name = "kq_stream", .module = stream_mod },
-                .{ .name = "kq_stream_exec", .module = stream_exec_mod },
-                .{ .name = "kq_record_source", .module = record_source_mod },
-                .{ .name = "kq_writers", .module = writers_mod },
-                .{ .name = "kq_build_options", .module = build_options.createModule() },
+                .{ .name = "kqq", .module = mod },
+                .{ .name = "kqq_query", .module = query_mod },
+                .{ .name = "kqq_stream", .module = stream_mod },
+                .{ .name = "kqq_stream_exec", .module = stream_exec_mod },
+                .{ .name = "kqq_record_source", .module = record_source_mod },
+                .{ .name = "kqq_writers", .module = writers_mod },
+                .{ .name = "kqq_build_options", .module = build_options.createModule() },
             },
         }),
     });
@@ -276,7 +276,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/core/record.zig"),
             .target = target,
             .imports = &.{
-                .{ .name = "kq_query", .module = query_mod },
+                .{ .name = "kqq_query", .module = query_mod },
             },
         }),
     });
@@ -287,9 +287,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/exec/llm.zig"),
             .target = target,
             .imports = &.{
-                .{ .name = "kq_query", .module = query_mod },
-                .{ .name = "kq_record", .module = record_mod },
-                .{ .name = "kq_output", .module = output_mod },
+                .{ .name = "kqq_query", .module = query_mod },
+                .{ .name = "kqq_record", .module = record_mod },
+                .{ .name = "kqq_output", .module = output_mod },
             },
         }),
     });
@@ -300,15 +300,15 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/stream_exec.zig"),
             .target = target,
             .imports = &.{
-                .{ .name = "kq_query", .module = query_mod },
-                .{ .name = "kq_stream", .module = stream_mod },
-                .{ .name = "kq_regex", .module = regex_mod },
-                .{ .name = "kq_record", .module = record_mod },
-                .{ .name = "kq_expr", .module = expr_mod },
-                .{ .name = "kq_where", .module = where_mod },
-                .{ .name = "kq_output", .module = output_mod },
-                .{ .name = "kq_llm", .module = llm_mod },
-                .{ .name = "kq_raw_where", .module = raw_where_mod },
+                .{ .name = "kqq_query", .module = query_mod },
+                .{ .name = "kqq_stream", .module = stream_mod },
+                .{ .name = "kqq_regex", .module = regex_mod },
+                .{ .name = "kqq_record", .module = record_mod },
+                .{ .name = "kqq_expr", .module = expr_mod },
+                .{ .name = "kqq_where", .module = where_mod },
+                .{ .name = "kqq_output", .module = output_mod },
+                .{ .name = "kqq_llm", .module = llm_mod },
+                .{ .name = "kqq_raw_where", .module = raw_where_mod },
             },
         }),
     });
@@ -319,7 +319,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/record_source.zig"),
             .target = target,
             .imports = &.{
-                .{ .name = "kq_stream_exec", .module = stream_exec_mod },
+                .{ .name = "kqq_stream_exec", .module = stream_exec_mod },
             },
         }),
     });
@@ -330,10 +330,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/integration_tests.zig"),
             .target = target,
             .imports = &.{
-                .{ .name = "kq_query", .module = query_mod },
-                .{ .name = "kq_stream", .module = stream_mod },
-                .{ .name = "kq_stream_exec", .module = stream_exec_mod },
-                .{ .name = "kq_record_source", .module = record_source_mod },
+                .{ .name = "kqq_query", .module = query_mod },
+                .{ .name = "kqq_stream", .module = stream_mod },
+                .{ .name = "kqq_stream_exec", .module = stream_exec_mod },
+                .{ .name = "kqq_record_source", .module = record_source_mod },
             },
         }),
     });

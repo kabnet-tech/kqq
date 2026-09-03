@@ -17,10 +17,10 @@
 //! here produce records of that same type.
 
 const std = @import("std");
-const kq_stream_exec = @import("kq_stream_exec");
+const kqq_stream_exec = @import("kqq_stream_exec");
 
-pub const OwnedValue = kq_stream_exec.OwnedValue;
-pub const Record = kq_stream_exec.Record;
+pub const OwnedValue = kqq_stream_exec.OwnedValue;
+pub const Record = kqq_stream_exec.Record;
 
 // ─── TextLineSource ──────────────────────────────────────────────────────────
 //
@@ -28,7 +28,7 @@ pub const Record = kq_stream_exec.Record;
 // Blank lines are skipped.
 //
 // Usage:
-//   echo -e "hello\nworld" | kq --text 'select line where line contains "hello"'
+//   echo -e "hello\nworld" | kqq --text 'select line where line contains "hello"'
 
 pub const TextLineSource = struct {
     reader: *std.Io.Reader,
@@ -118,8 +118,8 @@ pub const TextLineSource = struct {
 // Extra columns are named by index. Missing columns become null.
 //
 // Usage:
-//   cat data.csv | kq --delim ',' --header 'select name, age where age > 30'
-//   echo "a:b:c" | kq --delim ':' --cols "x,y,z" 'select x'
+//   cat data.csv | kqq --delim ',' --header 'select name, age where age > 30'
+//   echo "a:b:c" | kqq --delim ':' --cols "x,y,z" 'select x'
 
 pub const DelimitedSource = struct {
     reader: *std.Io.Reader,

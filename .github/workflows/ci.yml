@@ -46,9 +46,9 @@ jobs:
 
       - name: Smoke test binary
         run: |
-          echo '{"name":"Alice","score":98}' | ./zig-out/bin/kq 'where score > 90'
-          echo '{"name":"Bob","score":50}' | ./zig-out/bin/kq 'select name, score // 0 as score'
-          ./zig-out/bin/kq --version
+          echo '{"name":"Alice","score":98}' | ./zig-out/bin/kqq 'where score > 90'
+          echo '{"name":"Bob","score":50}' | ./zig-out/bin/kqq 'select name, score // 0 as score'
+          ./zig-out/bin/kqq --version
 
   # ── Cross-compilation check (all supported targets) ───────────────────────
   # Verifies the code compiles for every target from a single Ubuntu runner.
@@ -109,6 +109,6 @@ jobs:
 
       - name: Show binary size
         run: |
-          if compgen -G "zig-out/bin/kq*" > /dev/null; then
-            ls -lh zig-out/bin/kq*
+          if compgen -G "zig-out/bin/kqq*" > /dev/null; then
+            ls -lh zig-out/bin/kqq*
           fi

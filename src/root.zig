@@ -1,4 +1,4 @@
-//! kq library root – JSON processing utilities.
+//! kqq library root – JSON processing utilities.
 const std = @import("std");
 
 /// Recursively flatten a JSON value into a single-level object.

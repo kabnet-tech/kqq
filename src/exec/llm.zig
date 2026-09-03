@@ -7,9 +7,9 @@
 //! aggregateGroupBy, etc.).
 
 const std = @import("std");
-const query = @import("kq_query");
-const record_mod = @import("kq_record");
-const output_mod = @import("kq_output");
+const query = @import("kqq_query");
+const record_mod = @import("kqq_record");
+const output_mod = @import("kqq_output");
 
 const Record = record_mod.Record;
 const OwnedValue = record_mod.OwnedValue;

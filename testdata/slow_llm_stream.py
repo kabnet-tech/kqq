@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Simulate an Ollama NDJSON token stream for testing kq's real-time emit.
+Simulate an Ollama NDJSON token stream for testing kqq's real-time emit.
 
 Each JSON object in RECORDS is broken into single-character fragments,
 emitted as {"response":"<char>"} envelopes with a configurable delay.
-A short pause between objects makes it easy to observe kq emitting
+A short pause between objects makes it easy to observe kqq emitting
 each matched record before the next object starts.
 
 Usage:
-  python3 testdata/slow_llm_stream.py | ./zig-out/bin/kq --llm response 'select name, dept where dept = "eng"'
-  python3 testdata/slow_llm_stream.py --delay 0.02 | ./zig-out/bin/kq --llm response 'select name, score where score > 80'
+  python3 testdata/slow_llm_stream.py | ./zig-out/bin/kqq --llm response 'select name, dept where dept = "eng"'
+  python3 testdata/slow_llm_stream.py --delay 0.02 | ./zig-out/bin/kqq --llm response 'select name, score where score > 80'
 
 Options:
   --delay <secs>   Delay between tokens (default: 0.04)

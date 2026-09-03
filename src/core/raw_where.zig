@@ -12,7 +12,7 @@
 //! string comparison with escape sequences, LIKE/IN/regex.
 
 const std = @import("std");
-const query = @import("kq_query");
+const query = @import("kqq_query");
 
 const Op = query.Op;
 

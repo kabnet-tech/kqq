@@ -1,4 +1,4 @@
-//! kq query engine
+//! kqq query engine
 //!
 //! Three query modes:
 //!
@@ -18,11 +18,11 @@
 //!      -> auto-detects all array roots, same relative SELECT/WHERE
 
 const std = @import("std");
-const regex = @import("kq_regex");
+const regex = @import("kqq_regex");
 
 const simpleRegexMatch = regex.simpleRegexMatch;
 const globLike = regex.globLike;
-const ast = @import("kq_ast");
+const ast = @import("kqq_ast");
 
 // Re-export all AST types for backward compatibility
 pub const ExprTag = ast.ExprTag;
@@ -48,7 +48,7 @@ pub const Query = ast.Query;
 pub const cloneExpr = ast.cloneExpr;
 
 // Tokenizer (from tokenizer.zig)
-const tokenizer_mod = @import("kq_tokenizer");
+const tokenizer_mod = @import("kqq_tokenizer");
 const TokTag = tokenizer_mod.TokTag;
 const Token = tokenizer_mod.Token;
 const Tokenizer = tokenizer_mod.Tokenizer;

@@ -4,10 +4,10 @@
 //! Used by the streaming executors and the expression evaluator (for CASE WHEN).
 
 const std = @import("std");
-const query = @import("kq_query");
-const regex = @import("kq_regex");
-const record_mod = @import("kq_record");
-const expr_mod = @import("kq_expr");
+const query = @import("kqq_query");
+const regex = @import("kqq_regex");
+const record_mod = @import("kqq_record");
+const expr_mod = @import("kqq_expr");
 
 const Record = record_mod.Record;
 const OwnedValue = record_mod.OwnedValue;

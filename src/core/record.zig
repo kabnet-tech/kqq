@@ -7,7 +7,7 @@
 //! This module is the foundation that all executor modules depend on.
 
 const std = @import("std");
-const query = @import("kq_query");
+const query = @import("kqq_query");
 
 const OrderField = query.OrderField;
 

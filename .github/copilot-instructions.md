@@ -1,8 +1,8 @@
-# Copilot Instructions for kq
+# Copilot Instructions for kqq
 
 ## What this project is
 
-kq is a streaming SQL query tool for NDJSON/JSON, written in Zig 0.16.0 with
+kqq is a streaming SQL query tool for NDJSON/JSON, written in Zig 0.16.0 with
 zero dependencies. Single static binary. The core value proposition is
 single-pass streaming aggregation with O(1) memory per group — never buffer
 the full input.
@@ -10,7 +10,7 @@ the full input.
 ## Build & test commands
 
 ```bash
-zig build                          # debug build → zig-out/bin/kq
+zig build                          # debug build → zig-out/bin/kqq
 zig build -Doptimize=ReleaseFast   # release build (ALWAYS use for benchmarks)
 zig build test --summary all       # unit + integration tests (8 suites)
 python3 tests/cli_tests.py         # end-to-end CLI tests (63 tests)
@@ -67,13 +67,13 @@ Data flows: **parse → AST → execute → emit**
 
 - **Debug builds are ~17× slower.** Never benchmark a debug build; the
   performance docs assume ReleaseFast.
-- **Cross-compiling overwrites `zig-out/bin/kq`** with a foreign-arch binary.
+- **Cross-compiling overwrites `zig-out/bin/kqq`** with a foreign-arch binary.
   Re-run `zig build` before native tests or benchmarks, or you'll see
   `OSError: Exec format error`.
-- `head` in a pipe makes kq exit with `error: WriteFailed` (SIGPIPE) — that's
+- `head` in a pipe makes kqq exit with `error: WriteFailed` (SIGPIPE) — that's
   expected, not a bug.
 - `build.zig` hardcodes the version string (line ~174) and
-  `tests/cli_tests.py` asserts it (`kq X.Y.Z`) — bump all three places
+  `tests/cli_tests.py` asserts it (`kqq X.Y.Z`) — bump all three places
   (`build.zig.zon` too) when releasing.
 - The package fingerprint in `build.zig.zon` is derived from the package
   name; if you rename the package, Zig will tell you the new fingerprint.
@@ -83,4 +83,4 @@ Data flows: **parse → AST → execute → emit**
 - `ci.yml`: test job (Linux + macOS, ReleaseFast build + both test layers +
   smoke test) and a 19-target cross-compile matrix. All must pass.
 - `release.yml`: fires on `v*` tags, builds 15 platform binaries, publishes a
-  GitHub Release with SHA256 checksums. Asset names are `kq-<version>-<platform>`.
+  GitHub Release with SHA256 checksums. Asset names are `kqq-<version>-<platform>`.

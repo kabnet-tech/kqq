@@ -1,6 +1,6 @@
 //! stream_exec.zig — streaming query executor
 //!
-//! Executes a kq Query against a JSON stream without buffering the whole document.
+//! Executes a kqq Query against a JSON stream without buffering the whole document.
 //!
 //! Algorithm for  [users.*] select name, score where active = true order by score desc limit 10
 //!
@@ -24,15 +24,15 @@
 //!   - Input document         → never fully in RAM
 
 const std = @import("std");
-const query = @import("kq_query");
-const stream = @import("kq_stream");
-const regex = @import("kq_regex");
-const record_mod = @import("kq_record");
-const expr_mod = @import("kq_expr");
-const where_mod = @import("kq_where");
-const output_mod = @import("kq_output");
-const llm_mod = @import("kq_llm");
-const raw_where_mod = @import("kq_raw_where");
+const query = @import("kqq_query");
+const stream = @import("kqq_stream");
+const regex = @import("kqq_regex");
+const record_mod = @import("kqq_record");
+const expr_mod = @import("kqq_expr");
+const where_mod = @import("kqq_where");
+const output_mod = @import("kqq_output");
+const llm_mod = @import("kqq_llm");
+const raw_where_mod = @import("kqq_raw_where");
 
 const simpleRegexMatch = regex.simpleRegexMatch;
 const globLike = regex.globLike;
@@ -1722,7 +1722,7 @@ pub fn execGlobalAggNDJSON(
 // This enables real-time querying of LLM-generated JSON as it streams in.
 //
 // Usage:
-//   curl ... | kq --llm response 'select make, model where type = "sedan"'
+//   curl ... | kqq --llm response 'select make, model where type = "sedan"'
 
 pub fn execLlmStream(
     allocator: std.mem.Allocator,
@@ -1929,7 +1929,7 @@ pub fn execLlmStream(
     // Warn if the stream ended with unconsumed bytes in the accumulator
     // (indicates the LLM response was truncated / closed mid-object).
     if (accum.items.len > 0) {
-        std.debug.print("kq: warning: stream ended with {d} bytes of incomplete JSON discarded\n", .{accum.items.len});
+        std.debug.print("kqq: warning: stream ended with {d} bytes of incomplete JSON discarded\n", .{accum.items.len});
     }
 
     // Streaming path: close the JSON array and return without further buffering.

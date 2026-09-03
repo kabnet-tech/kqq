@@ -4,7 +4,7 @@
 //! raw values. Used by the streaming and buffered executors.
 
 const std = @import("std");
-const record_mod = @import("kq_record");
+const record_mod = @import("kqq_record");
 
 const Record = record_mod.Record;
 const OwnedValue = record_mod.OwnedValue;

@@ -1,19 +1,19 @@
 ---
 name: Bug report
-about: Report something kq does wrong — wrong output, crash, or error
+about: Report something kqq does wrong — wrong output, crash, or error
 title: ''
 labels: bug
 assignees: ''
 ---
 
-**kq version** (output of `kq --version`):
+**kqq version** (output of `kqq --version`):
 
 **OS / platform**:
 
 **Command** (exact query string and flags):
 
 ```
-kq '...'
+kqq '...'
 ```
 
 **Input data** (minimal sample, 1–3 lines):

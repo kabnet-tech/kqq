@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions and usage help
-    url: https://github.com/kck8/kq/discussions
+    url: https://github.com/kabnet-tech/kqq/discussions
     about: Ask how to write a query or use a flag — please don't open an issue for usage questions.

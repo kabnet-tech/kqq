@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI-level tests for kq — exercises main.zig flag parsing and dispatch paths.
+"""CLI-level tests for kqq — exercises main.zig flag parsing and dispatch paths.
 
 Run:  python3 tests/cli_tests.py
 Pass: exits 0 with a summary line
@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-KQ = str(ROOT / "zig-out/bin/kq")
+KQQ = str(ROOT / "zig-out/bin/kqq")
 
 NDJSON_USERS = b"""\
 {"name":"Alice","age":30,"active":true}
@@ -39,12 +39,12 @@ failed = 0
 
 
 def run(args, *, stdin=b"", env=None, expect_exit=0):
-    """Run kq with args, return (stdout, stderr, returncode)."""
+    """Run kqq with args, return (stdout, stderr, returncode)."""
     e = dict(os.environ)
     if env:
         e.update(env)
     r = subprocess.run(
-        [KQ] + args,
+        [KQQ] + args,
         input=stdin,
         capture_output=True,
         env=e,
@@ -110,13 +110,13 @@ check("--version flag",
       args=["--version"],
       stdin=b"",
       expect_exit=0,
-      stdout_contains="kq 0.7.0")
+      stdout_contains="kqq 0.7.0")
 
 check("-V short flag",
       args=["-V"],
       stdin=b"",
       expect_exit=0,
-      stdout_contains="kq 0.7.0")
+      stdout_contains="kqq 0.7.0")
 
 check("--help flag",
       args=["--help"],
@@ -445,7 +445,7 @@ check("--expect with --llm rejects wrong-type record",
 # ─── --api presets ────────────────────────────────────────────────────────────
 # These require llm_field / llm_path to be set via the preset.
 # We can verify the preset dispatches correctly by checking that
-# kq doesn't die with "requires a query argument" (it sets field internally).
+# kqq doesn't die with "requires a query argument" (it sets field internally).
 
 OLLAMA_STREAM = b"""\
 {"model":"llama3","response":"{","done":false}

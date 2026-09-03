@@ -29,10 +29,10 @@
 //!   - Functions applied to wrong type (upper on number etc.)
 
 const std = @import("std");
-const query = @import("kq_query");
-const stream = @import("kq_stream");
-const stream_exec = @import("kq_stream_exec");
-const record_source = @import("kq_record_source");
+const query = @import("kqq_query");
+const stream = @import("kqq_stream");
+const stream_exec = @import("kqq_stream_exec");
+const record_source = @import("kqq_record_source");
 
 const ExecOptions = stream_exec.ExecOptions;
 
@@ -2715,7 +2715,7 @@ test "failure: division by zero in WHERE does not crash" {
 // ── LIMIT edge cases ──────────────────────────────────────────────────────────
 
 test "failure: limit 0 emits at most 1 record (emit-then-check)" {
-    // kq uses emit-then-check for streaming early-stop, so limit 0
+    // kqq uses emit-then-check for streaming early-stop, so limit 0
     // emits the first match before the counter fires. Documented behavior.
     const data =
         \\{"name":"Alice"}
@@ -2806,7 +2806,7 @@ test "failure: unclosed parenthesis in WHERE is a parse error" {
     try std.testing.expectError(error.UnexpectedToken, err);
 }
 
-// Note: kq's parser is lenient about trailing tokens after ORDER BY and LIMIT —
+// Note: kqq's parser is lenient about trailing tokens after ORDER BY and LIMIT —
 // unknown direction tokens are ignored (defaults to asc) and unknown limit values
 // result in no limit. These are parser design choices, not bugs to test.
 

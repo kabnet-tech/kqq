@@ -48,39 +48,39 @@ jobs:
         include:
           # Linux — musl (fully static, recommended)
           - target: x86_64-linux-musl
-            asset: kq-linux-x86_64
+            asset: kqq-linux-x86_64
           - target: aarch64-linux-musl
-            asset: kq-linux-aarch64
+            asset: kqq-linux-aarch64
           - target: arm-linux-musleabihf
-            asset: kq-linux-armv6hf
+            asset: kqq-linux-armv6hf
           - target: thumb-linux-musleabihf
-            asset: kq-linux-armv7hf
+            asset: kqq-linux-armv7hf
           - target: x86-linux-musl
-            asset: kq-linux-i386
+            asset: kqq-linux-i386
           - target: riscv64-linux-musl
-            asset: kq-linux-riscv64
+            asset: kqq-linux-riscv64
           - target: powerpc64le-linux-musl
-            asset: kq-linux-ppc64le
+            asset: kqq-linux-ppc64le
           # Linux — glibc (for distros that don't want musl)
           - target: x86_64-linux-gnu
-            asset: kq-linux-x86_64-gnu
+            asset: kqq-linux-x86_64-gnu
           - target: aarch64-linux-gnu
-            asset: kq-linux-aarch64-gnu
+            asset: kqq-linux-aarch64-gnu
           # macOS
           - target: x86_64-macos
-            asset: kq-macos-x86_64
+            asset: kqq-macos-x86_64
           - target: aarch64-macos
-            asset: kq-macos-aarch64
+            asset: kqq-macos-aarch64
           # Windows
           - target: x86_64-windows
-            asset: kq-windows-x86_64.exe
+            asset: kqq-windows-x86_64.exe
           - target: aarch64-windows
-            asset: kq-windows-aarch64.exe
+            asset: kqq-windows-aarch64.exe
           # BSDs
           - target: x86_64-freebsd
-            asset: kq-freebsd-x86_64
+            asset: kqq-freebsd-x86_64
           - target: aarch64-freebsd
-            asset: kq-freebsd-aarch64
+            asset: kqq-freebsd-aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -106,18 +106,18 @@ jobs:
           zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
           # Strip native x86_64 Linux binaries (smaller release)
           if [[ "${{ matrix.target }}" == "x86_64-linux-musl" || "${{ matrix.target }}" == "x86_64-linux-gnu" ]]; then
-            strip zig-out/bin/kq 2>/dev/null || true
+            strip zig-out/bin/kqq 2>/dev/null || true
           fi
 
       - name: Package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            ARCHIVE="kq-${VERSION}-${{ matrix.asset }}.zip"
-            cd zig-out/bin && zip -q "../../$ARCHIVE" kq.exe
+            ARCHIVE="kqq-${VERSION}-${{ matrix.asset }}.zip"
+            cd zig-out/bin && zip -q "../../$ARCHIVE" kqq.exe
           else
-            ARCHIVE="kq-${VERSION}-${{ matrix.asset }}.tar.gz"
-            tar -C zig-out/bin -czf "$ARCHIVE" kq
+            ARCHIVE="kqq-${VERSION}-${{ matrix.asset }}.tar.gz"
+            tar -C zig-out/bin -czf "$ARCHIVE" kqq
           fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
@@ -128,7 +128,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: kq-*-${{ matrix.asset }}.*
+          path: kqq-*-${{ matrix.asset }}.*
 
   release:
     name: Create GitHub Release
@@ -151,7 +151,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum kq-* > checksums.txt
+          sha256sum kqq-* > checksums.txt
           sha256sum checksums.txt > checksums.txt.sha256
           echo "=== checksums.txt ==="
           cat checksums.txt
@@ -160,12 +160,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/kq-*
+            artifacts/kqq-*
             artifacts/checksums.txt
             artifacts/checksums.txt.sha256
           generate_release_notes: true
           body: |
-            ## kq ${{ github.ref_name }}
+            ## kqq ${{ github.ref_name }}
 
             Fast SQL-like NDJSON query tool. Single static binary, zero dependencies.
 
@@ -173,21 +173,21 @@ jobs:
 
             | Platform | Archive |
             |----------|--------|
-            | Linux x86_64 (musl, static) | `kq-${{ github.ref_name }}-linux-x86_64.tar.gz` |
-            | Linux aarch64 (musl, static) | `kq-${{ github.ref_name }}-linux-aarch64.tar.gz` |
-            | Linux ARMv6hf (musl, static) | `kq-${{ github.ref_name }}-linux-armv6hf.tar.gz` |
-            | Linux ARMv7hf (musl, static) | `kq-${{ github.ref_name }}-linux-armv7hf.tar.gz` |
-            | Linux i386 (musl, static) | `kq-${{ github.ref_name }}-linux-i386.tar.gz` |
-            | Linux RISC-V 64 (musl, static) | `kq-${{ github.ref_name }}-linux-riscv64.tar.gz` |
-            | Linux POWER9 LE (musl, static) | `kq-${{ github.ref_name }}-linux-ppc64le.tar.gz` |
-            | Linux x86_64 (glibc) | `kq-${{ github.ref_name }}-linux-x86_64-gnu.tar.gz` |
-            | Linux aarch64 (glibc) | `kq-${{ github.ref_name }}-linux-aarch64-gnu.tar.gz` |
-            | macOS x86_64 | `kq-${{ github.ref_name }}-macos-x86_64.tar.gz` |
-            | macOS Apple Silicon | `kq-${{ github.ref_name }}-macos-aarch64.tar.gz` |
-            | Windows x86_64 | `kq-${{ github.ref_name }}-windows-x86_64.zip` |
-            | Windows aarch64 | `kq-${{ github.ref_name }}-windows-aarch64.zip` |
-            | FreeBSD x86_64 | `kq-${{ github.ref_name }}-freebsd-x86_64.tar.gz` |
-            | FreeBSD aarch64 | `kq-${{ github.ref_name }}-freebsd-aarch64.tar.gz` |
+            | Linux x86_64 (musl, static) | `kqq-${{ github.ref_name }}-linux-x86_64.tar.gz` |
+            | Linux aarch64 (musl, static) | `kqq-${{ github.ref_name }}-linux-aarch64.tar.gz` |
+            | Linux ARMv6hf (musl, static) | `kqq-${{ github.ref_name }}-linux-armv6hf.tar.gz` |
+            | Linux ARMv7hf (musl, static) | `kqq-${{ github.ref_name }}-linux-armv7hf.tar.gz` |
+            | Linux i386 (musl, static) | `kqq-${{ github.ref_name }}-linux-i386.tar.gz` |
+            | Linux RISC-V 64 (musl, static) | `kqq-${{ github.ref_name }}-linux-riscv64.tar.gz` |
+            | Linux POWER9 LE (musl, static) | `kqq-${{ github.ref_name }}-linux-ppc64le.tar.gz` |
+            | Linux x86_64 (glibc) | `kqq-${{ github.ref_name }}-linux-x86_64-gnu.tar.gz` |
+            | Linux aarch64 (glibc) | `kqq-${{ github.ref_name }}-linux-aarch64-gnu.tar.gz` |
+            | macOS x86_64 | `kqq-${{ github.ref_name }}-macos-x86_64.tar.gz` |
+            | macOS Apple Silicon | `kqq-${{ github.ref_name }}-macos-aarch64.tar.gz` |
+            | Windows x86_64 | `kqq-${{ github.ref_name }}-windows-x86_64.zip` |
+            | Windows aarch64 | `kqq-${{ github.ref_name }}-windows-aarch64.zip` |
+            | FreeBSD x86_64 | `kqq-${{ github.ref_name }}-freebsd-x86_64.tar.gz` |
+            | FreeBSD aarch64 | `kqq-${{ github.ref_name }}-freebsd-aarch64.tar.gz` |
 
             ### Verify download integrity
 
@@ -200,10 +200,10 @@ jobs:
 
             ```bash
             # Linux x86_64
-            curl -Lo kq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kq-${{ github.ref_name }}-linux-x86_64.tar.gz
-            tar xzf kq.tar.gz && chmod +x kq && sudo mv kq /usr/local/bin/
+            curl -Lo kqq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kqq-${{ github.ref_name }}-linux-x86_64.tar.gz
+            tar xzf kqq.tar.gz && chmod +x kqq && sudo mv kqq /usr/local/bin/
 
             # macOS Apple Silicon
-            curl -Lo kq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kq-${{ github.ref_name }}-macos-aarch64.tar.gz
-            tar xzf kq.tar.gz && chmod +x kq && sudo mv kq /usr/local/bin/
+            curl -Lo kqq.tar.gz https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kqq-${{ github.ref_name }}-macos-aarch64.tar.gz
+            tar xzf kqq.tar.gz && chmod +x kqq && sudo mv kqq /usr/local/bin/
             ```

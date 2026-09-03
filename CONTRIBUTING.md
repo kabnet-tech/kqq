@@ -1,6 +1,6 @@
-# Contributing to kq
+# Contributing to kqq
 
-Thanks for your interest in contributing! kq is a small, focused tool and
+Thanks for your interest in contributing! kqq is a small, focused tool and
 contributions are welcome — bug reports, bug fixes, documentation, and
 well-scoped features.
 
@@ -18,22 +18,22 @@ python3 tests/cli_tests.py       # end-to-end CLI tests
 
 ## Reporting bugs
 
-Open a [bug report](https://github.com/kck8/kq/issues/new?template=bug_report.md)
+Open a [bug report](https://github.com/kabnet-tech/kqq/issues/new?template=bug_report.md)
 and include:
 
-- The exact `kq` invocation (query string and flags)
+- The exact `kqq` invocation (query string and flags)
 - A minimal sample of input data (1–3 lines is usually enough)
 - Expected output vs actual output
-- Your `kq --version` and OS
+- Your `kqq --version` and OS
 
 If the output is wrong rather than an error, include what `jq` produces for
 the same data if you can — it helps pin down semantics.
 
 ## Suggesting features
 
-Open a [feature request](https://github.com/kck8/kq/issues/new?template=feature_request.md).
+Open a [feature request](https://github.com/kabnet-tech/kqq/issues/new?template=feature_request.md).
 Good feature requests explain the *workload* you're trying to handle, not just
-the syntax you want. kq deliberately stays small: the bar for new syntax is
+the syntax you want. kqq deliberately stays small: the bar for new syntax is
 "common enough that data engineers hit it weekly on NDJSON streams."
 
 ## Code guidelines
@@ -47,7 +47,7 @@ the syntax you want. kq deliberately stays small: the bar for new syntax is
 - **Tests with every change** — parser/executor changes need coverage in
   `src/integration_tests.zig` (Zig) and/or `tests/cli_tests.py` (end-to-end).
   Bug fixes need a regression test that fails without the fix.
-- **No new dependencies** — kq is stdlib-only Zig by design.
+- **No new dependencies** — kqq is stdlib-only Zig by design.
 
 ## Pull requests
 

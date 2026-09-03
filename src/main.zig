@@ -1,16 +1,16 @@
 const std = @import("std");
-const kq = @import("kq");
-const kq_query = @import("kq_query");
-const kq_stream_exec = @import("kq_stream_exec");
-const kq_record_source = @import("kq_record_source");
-const kq_writers = @import("kq_writers");
-const kq_build_options = @import("kq_build_options");
+const kqq = @import("kqq");
+const kqq_query = @import("kqq_query");
+const kqq_stream_exec = @import("kqq_stream_exec");
+const kqq_record_source = @import("kqq_record_source");
+const kqq_writers = @import("kqq_writers");
+const kqq_build_options = @import("kqq_build_options");
 
-const NullCountWriterCtx = kq_writers.NullCountWriterCtx;
-const null_count_vtable = kq_writers.null_count_vtable;
-const TeeWriterCtx = kq_writers.TeeWriterCtx;
-const tee_vtable = kq_writers.tee_vtable;
-const sanitizeFilename = kq_writers.sanitizeFilename;
+const NullCountWriterCtx = kqq_writers.NullCountWriterCtx;
+const null_count_vtable = kqq_writers.null_count_vtable;
+const TeeWriterCtx = kqq_writers.TeeWriterCtx;
+const tee_vtable = kqq_writers.tee_vtable;
+const sanitizeFilename = kqq_writers.sanitizeFilename;
 
 fn die(msg: []const u8) noreturn {
     var buf: [512]u8 = undefined;
@@ -26,7 +26,7 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const e = std.debug.lockStderr(&buf);
     defer std.debug.unlockStderr();
-    e.file_writer.interface.print("kq: warning: " ++ fmt ++ "\n", args) catch {};
+    e.file_writer.interface.print("kqq: warning: " ++ fmt ++ "\n", args) catch {};
     e.file_writer.interface.flush() catch {};
 }
 
@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Parse flags and positional args
     // Usage:
-    //   kq [--flat] [--buf] [--ndjson] ['query']
+    //   kqq [--flat] [--buf] [--ndjson] ['query']
     //   --flat        : flatten JSON to dot-path keys before querying
     //   --buf         : buffer entire input (disables streaming)
     //   --ndjson      : input is newline-delimited JSON (one object per line)
@@ -123,13 +123,13 @@ pub fn main(init: std.process.Init) !void {
     var flat_mode = false;
     var buf_mode = false;
     var raw_mode = false;
-    var out_format = kq_stream_exec.OutputFormat.ndjson;
+    var out_format = kqq_stream_exec.OutputFormat.ndjson;
     var query_src: ?[]const u8 = null;
     var tee_path: ?[]const u8 = null;
     var reject_path: ?[]const u8 = null;
     var llm_field: ?[]const u8 = null;
     var rolling_mode = false;
-    var api_mode: ?kq_stream_exec.ApiMode = null;
+    var api_mode: ?kqq_stream_exec.ApiMode = null;
     var llm_path: ?[]const u8 = null;
     var expect_schema: ?[]const u8 = null;
     var text_mode = false;
@@ -150,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             const help =
-                \\Usage: STDIN | kq [OPTIONS] ['<query>']
+                \\Usage: STDIN | kqq [OPTIONS] ['<query>']
                 \\
                 \\Options:
                 \\  --flat            Flatten nested JSON to dot-path keys
@@ -179,10 +179,10 @@ pub fn main(init: std.process.Init) !void {
                 \\  [scope]  select <fields>  where <expr>  order by <f> asc|desc  limit N  group by <f>
                 \\
                 \\Examples:
-                \\  cat logs.ndjson | kq 'select name, score where active = true order by score desc limit 10'
-                \\  cat data.json   | kq '[users.*] select email where role = "admin"'
-                \\  curl .../api/generate ... | kq --api ollama 'select name where price < 100'
-                \\  cat file.csv    | kq --delim , --header 'select name, city where age > 30'
+                \\  cat logs.ndjson | kqq 'select name, score where active = true order by score desc limit 10'
+                \\  cat data.json   | kqq '[users.*] select email where role = "admin"'
+                \\  curl .../api/generate ... | kqq --api ollama 'select name where price < 100'
+                \\  cat file.csv    | kqq --delim , --header 'select name, city where age > 30'
                 \\
             ;
             var buf: [512]u8 = undefined;
@@ -193,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             var buf: [64]u8 = undefined;
             var w = std.Io.File.stdout().writer(io, &buf);
-            w.interface.print("kq {s}\n", .{kq_build_options.version}) catch {};
+            w.interface.print("kqq {s}\n", .{kqq_build_options.version}) catch {};
             w.interface.flush() catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--flat")) {
@@ -307,7 +307,7 @@ pub fn main(init: std.process.Init) !void {
     {
         var buf: [256]u8 = undefined;
         var ew = std.Io.File.stderr().writer(io, &buf);
-        ew.interface.writeAll("kq: no input. Pipe data in, or use --help for usage.\n") catch {};
+        ew.interface.writeAll("kqq: no input. Pipe data in, or use --help for usage.\n") catch {};
         ew.interface.flush() catch {};
         std.process.exit(1);
     }
@@ -352,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
     // ── --out file: tee output to both stdout and a seekable file ─────────
     // DuckDB requires a seekable file (not an anonymous pipe) for read_ndjson().
     // --out <file> writes output to both stdout and the named file so that:
-    //   kq 'filter' --ndjson --out /tmp/clean.ndjson < source.ndjson
+    //   kqq 'filter' --ndjson --out /tmp/clean.ndjson < source.ndjson
     //   duckdb -c "SELECT ... FROM read_ndjson('/tmp/clean.ndjson')"
     var out_file: std.Io.File = undefined;
     var out_fbuf: [65536]u8 = undefined;
@@ -483,7 +483,7 @@ pub fn main(init: std.process.Init) !void {
     // Input is buffered once, then each query runs over the same data.
     if (query_src) |qs| {
         if (std.mem.indexOfScalar(u8, qs, ';') != null) {
-            const queries = kq_query.parseMulti(allocator, qs) catch {
+            const queries = kqq_query.parseMulti(allocator, qs) catch {
                 die("failed to parse multi-query");
             };
             defer {
@@ -519,7 +519,7 @@ pub fn main(init: std.process.Init) !void {
                 else
                     primary_out;
 
-                const opts = kq_stream_exec.ExecOptions{
+                const opts = kqq_stream_exec.ExecOptions{
                     .raw = raw_mode,
                     .format = out_format,
                     .tee_writer = tee_iface,
@@ -530,7 +530,7 @@ pub fn main(init: std.process.Init) !void {
                 var sub_reader = std.Io.Reader.fixed(input_data);
 
                 if (q.group_by != null) {
-                    _ = kq_stream_exec.execGroupByNDJSON(
+                    _ = kqq_stream_exec.execGroupByNDJSON(
                         allocator,
                         &sub_reader,
                         q,
@@ -540,7 +540,7 @@ pub fn main(init: std.process.Init) !void {
                         continue;
                     };
                 } else if (q.global_agg) {
-                    _ = kq_stream_exec.execGlobalAggNDJSON(
+                    _ = kqq_stream_exec.execGlobalAggNDJSON(
                         allocator,
                         &sub_reader,
                         q,
@@ -550,7 +550,7 @@ pub fn main(init: std.process.Init) !void {
                         continue;
                     };
                 } else {
-                    _ = kq_stream_exec.execStreamNDJSON(
+                    _ = kqq_stream_exec.execStreamNDJSON(
                         allocator,
                         &sub_reader,
                         q,
@@ -573,7 +573,7 @@ pub fn main(init: std.process.Init) !void {
     if (split_by_field) |split_field| {
         const qs = query_src orelse "select *";
         var fp1: usize = 0;
-        const q = kq_query.parse(allocator, qs, &fp1) catch |err| {
+        const q = kqq_query.parse(allocator, qs, &fp1) catch |err| {
             dieQuery(qs, fp1, err);
         };
         defer q.deinit(allocator);
@@ -588,7 +588,7 @@ pub fn main(init: std.process.Init) !void {
         var mem_writer = std.Io.Writer.Allocating.init(allocator);
         defer mem_writer.deinit();
 
-        const opts = kq_stream_exec.ExecOptions{
+        const opts = kqq_stream_exec.ExecOptions{
             .raw = false,
             .format = .json,
             .tee_writer = tee_iface,
@@ -597,11 +597,11 @@ pub fn main(init: std.process.Init) !void {
 
         var sub_reader = std.Io.Reader.fixed(input_data);
         if (q.group_by != null) {
-            _ = kq_stream_exec.execGroupByNDJSON(allocator, &sub_reader, q, &mem_writer.writer, opts) catch {};
+            _ = kqq_stream_exec.execGroupByNDJSON(allocator, &sub_reader, q, &mem_writer.writer, opts) catch {};
         } else if (q.global_agg) {
-            _ = kq_stream_exec.execGlobalAggNDJSON(allocator, &sub_reader, q, &mem_writer.writer, opts) catch {};
+            _ = kqq_stream_exec.execGlobalAggNDJSON(allocator, &sub_reader, q, &mem_writer.writer, opts) catch {};
         } else {
-            _ = kq_stream_exec.execStreamNDJSON(allocator, &sub_reader, q, &mem_writer.writer, opts) catch {};
+            _ = kqq_stream_exec.execStreamNDJSON(allocator, &sub_reader, q, &mem_writer.writer, opts) catch {};
         }
 
         // Now split the output by the field value.
@@ -730,12 +730,12 @@ pub fn main(init: std.process.Init) !void {
     if (text_mode or delim_char != null) {
         const qs = query_src orelse "select *";
         var fp2: usize = 0;
-        const q = kq_query.parse(allocator, qs, &fp2) catch |err| {
+        const q = kqq_query.parse(allocator, qs, &fp2) catch |err| {
             dieQuery(qs, fp2, err);
         };
         defer q.deinit(allocator);
 
-        const opts = kq_stream_exec.ExecOptions{
+        const opts = kqq_stream_exec.ExecOptions{
             .raw = raw_mode,
             .format = out_format,
             .tee_writer = tee_iface,
@@ -747,18 +747,18 @@ pub fn main(init: std.process.Init) !void {
 
         if (text_mode) {
             // Plain text mode: each line → {line: "...", _n: N}
-            var src = kq_record_source.TextLineSource.init(
+            var src = kqq_record_source.TextLineSource.init(
                 allocator,
                 &stdin_file_reader.interface,
             );
             defer src.deinit();
 
             if (q.group_by != null) {
-                _ = kq_stream_exec.execGenericGroupBy(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
+                _ = kqq_stream_exec.execGenericGroupBy(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             } else if (q.global_agg) {
-                _ = kq_stream_exec.execGenericGlobalAgg(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
+                _ = kqq_stream_exec.execGenericGlobalAgg(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             } else {
-                _ = kq_stream_exec.execGenericSource(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
+                _ = kqq_stream_exec.execGenericSource(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             }
         } else {
             // Delimited mode: parse --cols into slice if provided
@@ -774,7 +774,7 @@ pub fn main(init: std.process.Init) !void {
             }
             const explicit: ?[]const []const u8 = if (n_cols > 0) col_buf[0..n_cols] else null;
 
-            var src = kq_record_source.DelimitedSource.init(
+            var src = kqq_record_source.DelimitedSource.init(
                 allocator,
                 &stdin_file_reader.interface,
                 delim_char.?,
@@ -784,11 +784,11 @@ pub fn main(init: std.process.Init) !void {
             defer src.deinit();
 
             if (q.group_by != null) {
-                _ = kq_stream_exec.execGenericGroupBy(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
+                _ = kqq_stream_exec.execGenericGroupBy(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             } else if (q.global_agg) {
-                _ = kq_stream_exec.execGenericGlobalAgg(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
+                _ = kqq_stream_exec.execGenericGlobalAgg(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             } else {
-                _ = kq_stream_exec.execGenericSource(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
+                _ = kqq_stream_exec.execGenericSource(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             }
         }
         try primary_out.flush();
@@ -803,19 +803,19 @@ pub fn main(init: std.process.Init) !void {
     if (llm_field != null or llm_path != null) {
         const qs = query_src orelse die("--llm/--llm-path requires a query argument");
         var fp3: usize = 0;
-        const q = kq_query.parse(allocator, qs, &fp3) catch |err| {
+        const q = kqq_query.parse(allocator, qs, &fp3) catch |err| {
             dieQuery(qs, fp3, err);
         };
         defer q.deinit(allocator);
 
         // Parse --expect schema if provided
         const schema = if (expect_schema) |es|
-            (kq_stream_exec.parseExpectSchema(allocator, es) catch die("invalid --expect schema"))
+            (kqq_stream_exec.parseExpectSchema(allocator, es) catch die("invalid --expect schema"))
         else
             null;
         defer if (schema) |s| allocator.free(s);
 
-        const opts = kq_stream_exec.ExecOptions{
+        const opts = kqq_stream_exec.ExecOptions{
             .raw = raw_mode,
             .format = out_format,
             .tee_writer = tee_iface,
@@ -830,7 +830,7 @@ pub fn main(init: std.process.Init) !void {
         var stdin_file_reader = std.Io.File.stdin().reader(io, &stdin_rbuf);
 
         if (q.group_by != null) {
-            _ = kq_stream_exec.execLlmGroupBy(
+            _ = kqq_stream_exec.execLlmGroupBy(
                 allocator,
                 &stdin_file_reader.interface,
                 q,
@@ -838,7 +838,7 @@ pub fn main(init: std.process.Init) !void {
                 opts,
             ) catch |err| dieErr(err);
         } else if (q.global_agg) {
-            _ = kq_stream_exec.execLlmGlobalAgg(
+            _ = kqq_stream_exec.execLlmGlobalAgg(
                 allocator,
                 &stdin_file_reader.interface,
                 q,
@@ -846,7 +846,7 @@ pub fn main(init: std.process.Init) !void {
                 opts,
             ) catch |err| dieErr(err);
         } else {
-            _ = kq_stream_exec.execLlmStream(
+            _ = kqq_stream_exec.execLlmStream(
                 allocator,
                 &stdin_file_reader.interface,
                 q,
@@ -863,7 +863,7 @@ pub fn main(init: std.process.Init) !void {
     if (!flat_mode and !buf_mode) {
         if (query_src) |qs| {
             var fp4: usize = 0;
-            const q = kq_query.parse(allocator, qs, &fp4) catch |err| {
+            const q = kqq_query.parse(allocator, qs, &fp4) catch |err| {
                 dieQuery(qs, fp4, err);
             };
             defer q.deinit(allocator);
@@ -871,7 +871,7 @@ pub fn main(init: std.process.Init) !void {
             const is_ndjson = q.scope_pattern == null;
             if (is_ndjson) {
                 var skip_count: usize = 0;
-                const opts = kq_stream_exec.ExecOptions{
+                const opts = kqq_stream_exec.ExecOptions{
                     .raw = raw_mode,
                     .format = out_format,
                     .tee_writer = tee_iface,
@@ -899,7 +899,7 @@ pub fn main(init: std.process.Init) !void {
 
                 // Route to appropriate executor based on query type
                 if (q.group_by != null) {
-                    _ = kq_stream_exec.execGroupByNDJSON(
+                    _ = kqq_stream_exec.execGroupByNDJSON(
                         allocator,
                         &stdin_file_reader.interface,
                         q,
@@ -907,7 +907,7 @@ pub fn main(init: std.process.Init) !void {
                         opts,
                     ) catch |err| dieErr(err);
                 } else if (q.global_agg) {
-                    _ = kq_stream_exec.execGlobalAggNDJSON(
+                    _ = kqq_stream_exec.execGlobalAggNDJSON(
                         allocator,
                         &stdin_file_reader.interface,
                         q,
@@ -915,7 +915,7 @@ pub fn main(init: std.process.Init) !void {
                         opts,
                     ) catch |err| dieErr(err);
                 } else {
-                    _ = kq_stream_exec.execStreamNDJSON(
+                    _ = kqq_stream_exec.execStreamNDJSON(
                         allocator,
                         &stdin_file_reader.interface,
                         q,
@@ -931,7 +931,7 @@ pub fn main(init: std.process.Init) !void {
             // No query: passthrough all records as array
             var stdin_rbuf: [65536]u8 = undefined;
             var stdin_file_reader = std.Io.File.stdin().reader(io, &stdin_rbuf);
-            const empty_q = kq_query.Query{
+            const empty_q = kqq_query.Query{
                 .scope_pattern = null,
                 .fields = null,
                 .where = null,
@@ -942,7 +942,7 @@ pub fn main(init: std.process.Init) !void {
                 .global_agg = false,
                 .distinct = false,
             };
-            _ = kq_stream_exec.execStreamNDJSON(
+            _ = kqq_stream_exec.execStreamNDJSON(
                 allocator,
                 &stdin_file_reader.interface,
                 empty_q,
@@ -960,7 +960,7 @@ pub fn main(init: std.process.Init) !void {
     if (!flat_mode and !buf_mode) {
         if (query_src) |qs| {
             var fp5: usize = 0;
-            const q = kq_query.parse(allocator, qs, &fp5) catch |err| {
+            const q = kqq_query.parse(allocator, qs, &fp5) catch |err| {
                 dieQuery(qs, fp5, err);
             };
             defer q.deinit(allocator);
@@ -969,10 +969,10 @@ pub fn main(init: std.process.Init) !void {
                 // Streaming scoped mode
                 var stdin_rbuf: [65536]u8 = undefined;
                 var stdin_file_reader = std.Io.File.stdin().reader(io, &stdin_rbuf);
-                const opts = kq_stream_exec.ExecOptions{ .raw = raw_mode, .format = out_format };
+                const opts = kqq_stream_exec.ExecOptions{ .raw = raw_mode, .format = out_format };
                 // Route group-by / global-agg queries to appropriate executor
                 _ = if (q.group_by != null)
-                    kq_stream_exec.execGroupByStream(
+                    kqq_stream_exec.execGroupByStream(
                         allocator,
                         &stdin_file_reader.interface,
                         q,
@@ -980,7 +980,7 @@ pub fn main(init: std.process.Init) !void {
                         opts,
                     ) catch |err| dieErr(err)
                 else if (q.global_agg)
-                    kq_stream_exec.execGlobalAggStream(
+                    kqq_stream_exec.execGlobalAggStream(
                         allocator,
                         &stdin_file_reader.interface,
                         q,
@@ -988,7 +988,7 @@ pub fn main(init: std.process.Init) !void {
                         opts,
                     ) catch |err| dieErr(err)
                 else
-                    kq_stream_exec.execStream(
+                    kqq_stream_exec.execStream(
                         allocator,
                         &stdin_file_reader.interface,
                         q,
@@ -1022,17 +1022,17 @@ pub fn main(init: std.process.Init) !void {
             while (it.next()) |e| allocator.free(e.key_ptr.*);
             flat.deinit(allocator);
         }
-        try kq.flatten(allocator, parsed.value, "", &flat);
+        try kqq.flatten(allocator, parsed.value, "", &flat);
 
         var result: std.json.ObjectMap = undefined;
         var result_owned = false;
         if (query_src) |qs| {
             var fp6: usize = 0;
-            const query = kq_query.parse(allocator, qs, &fp6) catch |err| {
+            const query = kqq_query.parse(allocator, qs, &fp6) catch |err| {
                 dieQuery(qs, fp6, err);
             };
             defer query.deinit(allocator);
-            result = try kq_query.execQuery(allocator, flat, query);
+            result = try kqq_query.execQuery(allocator, flat, query);
             result_owned = true;
         } else {
             result = flat;
@@ -1048,13 +1048,13 @@ pub fn main(init: std.process.Init) !void {
         // ── NATIVE BUFFERED MODE ───────────────────────────────────────────
         if (query_src) |qs| {
             var fp7: usize = 0;
-            const query = kq_query.parse(allocator, qs, &fp7) catch |err| {
+            const query = kqq_query.parse(allocator, qs, &fp7) catch |err| {
                 dieQuery(qs, fp7, err);
             };
             defer query.deinit(allocator);
-            const result = try kq_query.execQueryNative(allocator, parsed.value, query);
+            const result = try kqq_query.execQueryNative(allocator, parsed.value, query);
             const result_is_new = query.scope_pattern != null;
-            defer if (result_is_new) kq_query.freeValue(allocator, result);
+            defer if (result_is_new) kqq_query.freeValue(allocator, result);
             try std.json.Stringify.value(result, .{ .whitespace = .indent_2 }, primary_out);
         } else {
             try std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_2 }, primary_out);

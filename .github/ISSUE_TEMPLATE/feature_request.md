@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest a new capability for kq
+about: Suggest a new capability for kqq
 title: ''
 labels: enhancement
 assignees: ''
@@ -19,14 +19,14 @@ the job, not just the syntax.
 **What you'd like to be able to write** (proposed syntax, if you have one):
 
 ```
-kq 'select ...'
+kqq 'select ...'
 ```
 
 **How you solve it today** (jq, Miller, a script, etc.):
 
-**Is this blocking you from using kq, or a nice-to-have?**
+**Is this blocking you from using kqq, or a nice-to-have?**
 
 **Additional context**
-kq deliberately stays small — the bar for new syntax is "common enough that
+kqq deliberately stays small — the bar for new syntax is "common enough that
 data engineers hit it weekly on NDJSON streams." Explaining the workload helps
 a lot.
