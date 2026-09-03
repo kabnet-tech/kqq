@@ -77,17 +77,24 @@ POWER), macOS (Intel, Apple Silicon), Windows, and FreeBSD are on
 
 ```bash
 # Linux x86_64 — v0.9.0
-curl -LO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-linux-x86_64.tar.gz
 tar xzf kqq-0.9.0-linux-x86_64.tar.gz && sudo mv kqq /usr/local/bin/
 kqq --version
 ```
+
+> **`tar: not in gzip format`?** The download failed — `curl -O` saves GitHub's
+> "Not Found" page even on a 404. The `-f` flag above makes curl fail instead.
+> Check the exact asset name on the
+> [release page](https://github.com/kabnet-tech/kqq/releases) — names are
+> `kqq-<version>-<platform>.tar.gz` (e.g. `kqq-0.9.0-linux-x86_64.tar.gz`).
+> Windows assets are `.zip` — use `unzip`, not `tar`.
 
 <details>
 <summary>Other platforms</summary>
 
 ```bash
 # macOS Apple Silicon
-curl -LO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-macos-aarch64.tar.gz
+curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-macos-aarch64.tar.gz
 tar xzf kqq-0.9.0-macos-aarch64.tar.gz && sudo mv kqq /usr/local/bin/
 
 # Windows (PowerShell) — x86_64
