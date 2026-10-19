@@ -201,8 +201,8 @@ jobs:
             | Linux aarch64 (glibc) | `kqq-${{ env.VERSION }}-linux-aarch64-gnu.tar.gz` |
             | macOS x86_64 | `kqq-${{ env.VERSION }}-macos-x86_64.tar.gz` |
             | macOS Apple Silicon | `kqq-${{ env.VERSION }}-macos-aarch64.tar.gz` |
-            | Windows x86_64 | `kqq-${{ env.VERSION }}-windows-x86_64.zip` |
-            | Windows aarch64 | `kqq-${{ env.VERSION }}-windows-aarch64.zip` |
+            | Windows x86_64 | `kqq-${{ env.VERSION }}-windows-x86_64.exe.zip` |
+            | Windows aarch64 | `kqq-${{ env.VERSION }}-windows-aarch64.exe.zip` |
             | FreeBSD x86_64 | `kqq-${{ env.VERSION }}-freebsd-x86_64.tar.gz` |
             | FreeBSD aarch64 | `kqq-${{ env.VERSION }}-freebsd-aarch64.tar.gz` |
 

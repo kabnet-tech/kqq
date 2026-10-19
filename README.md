@@ -84,7 +84,7 @@ curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.17/kqq-0.9.1
 tar xzf kqq-0.9.17-macos-aarch64.tar.gz && sudo mv kqq /usr/local/bin/
 
 # Windows (PowerShell) — x86_64
-# Download kqq-0.9.17-windows-x86_64.zip from Releases and add kqq.exe to PATH
+# Download kqq-0.9.17-windows-x86_64.exe.zip from Releases and add kqq.exe to PATH
 ```
 
 See the [release page](https://github.com/kabnet-tech/kqq/releases) for all 15
