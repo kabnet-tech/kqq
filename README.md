@@ -5,7 +5,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/kabnet-tech/kqq?logo=github)](https://github.com/kabnet-tech/kqq/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows%20%7C%20FreeBSD-lightgrey)
-![Zig](https://img.shields.io/badge/zig-0.16.0-orange)
+![Zig](https://img.shields.io/badge/zig-0.17.0-orange)
 
 **SQL for streams.** Query NDJSON, JSON, CSV, and LLM token streams with SQL —
 at memory speeds, not disk speeds.
@@ -69,9 +69,9 @@ aarch64, ARM, RISC-V, POWER), macOS (Intel, Apple Silicon), Windows, and
 FreeBSD are on [GitHub Releases](https://github.com/kabnet-tech/kqq/releases):
 
 ```bash
-# Linux x86_64 — v0.9.0
-curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-linux-x86_64.tar.gz
-tar xzf kqq-0.9.0-linux-x86_64.tar.gz && sudo mv kqq /usr/local/bin/
+# Linux x86_64 — v0.9.17
+curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.17/kqq-0.9.17-linux-x86_64.tar.gz
+tar xzf kqq-0.9.17-linux-x86_64.tar.gz && sudo mv kqq /usr/local/bin/
 kqq --version
 ```
 
@@ -80,11 +80,11 @@ kqq --version
 
 ```bash
 # macOS Apple Silicon
-curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.0/kqq-0.9.0-macos-aarch64.tar.gz
-tar xzf kqq-0.9.0-macos-aarch64.tar.gz && sudo mv kqq /usr/local/bin/
+curl -fLO https://github.com/kabnet-tech/kqq/releases/download/v0.9.17/kqq-0.9.17-macos-aarch64.tar.gz
+tar xzf kqq-0.9.17-macos-aarch64.tar.gz && sudo mv kqq /usr/local/bin/
 
 # Windows (PowerShell) — x86_64
-# Download kqq-0.9.0-windows-x86_64.zip from Releases and add kqq.exe to PATH
+# Download kqq-0.9.17-windows-x86_64.zip from Releases and add kqq.exe to PATH
 ```
 
 See the [release page](https://github.com/kabnet-tech/kqq/releases) for all 15
@@ -92,7 +92,7 @@ platforms, including FreeBSD and glibc/musl Linux variants. SHA256 checksums
 are published with every release.
 </details>
 
-### Build from source (requires Zig 0.16.0)
+### Build from source (requires Zig 0.17.0)
 
 ```bash
 git clone https://github.com/kabnet-tech/kqq
@@ -154,7 +154,7 @@ zig build test --summary all     # unit + integration tests
 python3 tests/cli_tests.py       # end-to-end CLI tests
 ```
 
-Requires Zig 0.16.0. No other dependencies.
+Requires Zig 0.17.0. No other dependencies.
 
 ## License
 

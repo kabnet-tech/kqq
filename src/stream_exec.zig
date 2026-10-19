@@ -3721,15 +3721,15 @@ test "large lines: records after a >64KB line are not dropped" {
     var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
 
-    const blob70k = "x" ** 70_000;
-    const blob10k = "x" ** 10_000;
+    const blob70k: [70_000]u8 = @splat('x');
+    const blob10k: [10_000]u8 = @splat('x');
     try buf.appendSlice("{\"id\":\"before\",\"score\":1}\n");
     try buf.appendSlice("{\"id\":\"big70k\",\"score\":2,\"blob\":\"");
-    try buf.appendSlice(blob70k);
+    try buf.appendSlice(&blob70k);
     try buf.appendSlice("\"}\n");
     try buf.appendSlice("{\"id\":\"middle\",\"score\":3}\n");
     try buf.appendSlice("{\"id\":\"big10k\",\"score\":4,\"blob\":\"");
-    try buf.appendSlice(blob10k);
+    try buf.appendSlice(&blob10k);
     try buf.appendSlice("\"}\n");
     try buf.appendSlice("{\"id\":\"after\",\"score\":5}\n");
 
@@ -3757,15 +3757,15 @@ test "large lines: WHERE filter works across large records" {
     var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
 
-    const blob = "y" ** 70_000;
+    const blob: [70_000]u8 = @splat('y');
     try buf.appendSlice("{\"id\":\"a\",\"dept\":\"eng\",\"blob\":\"");
-    try buf.appendSlice(blob);
+    try buf.appendSlice(&blob);
     try buf.appendSlice("\"}\n");
     try buf.appendSlice("{\"id\":\"b\",\"dept\":\"hr\",\"blob\":\"");
-    try buf.appendSlice(blob);
+    try buf.appendSlice(&blob);
     try buf.appendSlice("\"}\n");
     try buf.appendSlice("{\"id\":\"c\",\"dept\":\"eng\",\"blob\":\"");
-    try buf.appendSlice(blob);
+    try buf.appendSlice(&blob);
     try buf.appendSlice("\"}\n");
 
     var r = std.Io.Reader.fixed(buf.items);
