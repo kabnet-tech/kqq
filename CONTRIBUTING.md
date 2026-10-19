@@ -7,7 +7,7 @@ well-scoped features.
 ## Getting started
 
 1. Fork the repo and clone your fork.
-2. Install [Zig 0.16.0](https://ziglang.org/download/) (the only dependency).
+2. Install [Zig 0.17.0](https://ziglang.org/download/) (the only dependency).
 3. Build and run the tests:
 
 ```bash
@@ -38,7 +38,7 @@ the syntax you want. kqq deliberately stays small: the bar for new syntax is
 
 ## Code guidelines
 
-- **Zig 0.16.0** — the codebase tracks the current Zig release; `std.process.Init`
+- **Zig 0.17.0** — the codebase tracks the current Zig release; `std.process.Init`
   style APIs are used throughout.
 - **Streaming first** — anything that buffers the whole input needs a strong
   justification. Aggregation state should be O(groups), not O(records).

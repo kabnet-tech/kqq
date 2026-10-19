@@ -2,7 +2,7 @@
 
 ## What this project is
 
-kqq is a streaming SQL query tool for NDJSON/JSON, written in Zig 0.16.0 with
+kqq is a streaming SQL query tool for NDJSON/JSON, written in Zig 0.17.0 with
 zero dependencies. Single static binary. The core value proposition is
 single-pass streaming aggregation with O(1) memory per group — never buffer
 the full input.
@@ -51,7 +51,7 @@ Data flows: **parse → AST → execute → emit**
 
 ## Conventions
 
-- Zig 0.16.0 APIs (`std.process.Init`, `std.Io.Reader/Writer`). Do not
+- Zig 0.17.0 APIs (`std.process.Init`, `std.Io.Reader/Writer`). Do not
   "modernize" to other styles or downgrade to older Zig idioms.
 - No new dependencies, ever. stdlib-only Zig.
 - Tests live in two layers: `src/integration_tests.zig` (Zig, uses

@@ -56,7 +56,7 @@ pub const Scanner = struct {
     str_buf: []u8, // heap-owned, grows as needed
     str_len: usize = 0,
     depth: usize = 0,
-    in_object: [128]bool = [_]bool{false} ** 128,
+    in_object: [128]bool = @splat(false),
     expect_key: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Self {
