@@ -27,7 +27,7 @@ Data flows: **parse → AST → execute → emit**
   `SelectField`, `GroupByKey`, `Query`) plus `cloneExpr`.
 - `src/query/tokenizer.zig` — token lexer.
 - `src/stream_exec.zig` — streaming executors, including `aggregateGroupBy`
-  (the heart of GROUP BY). ~2600 lines.
+  (the heart of GROUP BY). ~4550 lines.
 - `src/core/where.zig` — WHERE evaluation against Records.
 - `src/core/raw_where.zig` — fast-path WHERE on raw JSON bytes (skips parse).
 - `src/core/expr.zig` — expression evaluator + built-in functions.
@@ -58,9 +58,11 @@ Data flows: **parse → AST → execute → emit**
   `std.testing.allocator` so leaks fail tests) and `tests/cli_tests.py`
   (subprocess end-to-end). Parser/executor changes need coverage in at least
   one; **bug fixes need a regression test that fails without the fix**.
-- Test data facts (used in assertions): `testdata/employees.ndjson` has 20
-  employees, 6 departments, engineering=9; `testdata/events.ndjson` has 12
-  events (INFO=5, WARN=2, ERROR=5).
+- `testdata/` is for manual exploration only — nothing in `src/` or `tests/`
+  references it, so do not treat these as assertion fixtures. Actual contents:
+  `employees.ndjson` has 20 employees, 6 departments (the field is `dept`, not
+  `department`), engineering=9; `events.ndjson` has 20 events (INFO=9, WARN=4,
+  ERROR=7).
 - Commit messages: imperative mood, explain *why* in the body when non-obvious.
 
 ## Gotchas
@@ -72,15 +74,18 @@ Data flows: **parse → AST → execute → emit**
   `OSError: Exec format error`.
 - `head` in a pipe makes kqq exit with `error: WriteFailed` (SIGPIPE) — that's
   expected, not a bug.
-- `build.zig` hardcodes the version string (line ~174) and
-  `tests/cli_tests.py` asserts it (`kqq X.Y.Z`) — bump all three places
-  (`build.zig.zon` too) when releasing.
+- `.version` in `build.zig.zon` is the single source of truth for the version:
+  `build.zig` reads it via `@import("build.zig.zon").version`, so `--version`
+  follows automatically — do not reintroduce a hardcoded copy. Releasing still
+  means updating three *other* spots by hand: the `tests/cli_tests.py`
+  assertions (`kqq X.Y.Z`), the `VERSION` default in `scripts/install.sh`, and
+  the download URLs in `README.md`.
 - The package fingerprint in `build.zig.zon` is derived from the package
   name; if you rename the package, Zig will tell you the new fingerprint.
 
 ## CI
 
 - `ci.yml`: test job (Linux + macOS, ReleaseFast build + both test layers +
-  smoke test) and a 19-target cross-compile matrix. All must pass.
+  smoke test) and an 18-target cross-compile matrix. All must pass.
 - `release.yml`: fires on `v*` tags, builds 15 platform binaries, publishes a
   GitHub Release with SHA256 checksums. Asset names are `kqq-<version>-<platform>`.
