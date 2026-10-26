@@ -25,16 +25,16 @@ pub fn ownedMatchesCond(ov: OwnedValue, op: Op, qv: Value) bool {
     return switch (op) {
         .eq => switch (qv) {
             .string => |s| ov == .string and std.mem.eql(u8, ov.string, s),
-            .number => |n| ov == .number and ov.number == n,
+            .number => |n| ov == .number and ov.number.f == n,
             .boolean => |b| ov == .boolean and ov.boolean == b,
             .null_val => ov == .null_val,
             .string_list => false, // eq against a list makes no sense
         },
         .neq => !ownedMatchesCond(ov, .eq, qv),
-        .gt => ov == .number and qv == .number and ov.number > qv.number,
-        .lt => ov == .number and qv == .number and ov.number < qv.number,
-        .gte => ov == .number and qv == .number and ov.number >= qv.number,
-        .lte => ov == .number and qv == .number and ov.number <= qv.number,
+        .gt => ov == .number and qv == .number and ov.number.f > qv.number,
+        .lt => ov == .number and qv == .number and ov.number.f < qv.number,
+        .gte => ov == .number and qv == .number and ov.number.f >= qv.number,
+        .lte => ov == .number and qv == .number and ov.number.f <= qv.number,
         .like => ov == .string and qv == .string and globLike(qv.string, ov.string),
         // ── string operators ─────────────────────────────────────────────────
         .contains => {
@@ -128,7 +128,7 @@ pub fn condOnRecord(allocator: std.mem.Allocator, rec: *const Record, cond: quer
             var found = false;
             for (cond.value.string_list) |item| {
                 const n = std.fmt.parseFloat(f64, item) catch continue;
-                if (ov.number == n) {
+                if (ov.number.f == n) {
                     found = true;
                     break;
                 }

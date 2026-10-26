@@ -115,11 +115,19 @@ pub const TokTag = enum {
     eof,
 };
 
-pub const Token = struct { tag: TokTag, text: []const u8 };
+pub const Token = struct {
+    tag: TokTag,
+    text: []const u8,
+    /// Byte offset of the token in the query (for error carets).
+    start: usize = 0,
+};
 
 pub const Tokenizer = struct {
     src: []const u8,
     pos: usize = 0,
+    /// Where a parse error should be reported, when the parser knows better
+    /// than "wherever the tokenizer stopped" (e.g. the start of a trailing token).
+    err_pos: ?usize = null,
 
     pub fn peek(self: *Tokenizer) ?u8 {
         return if (self.pos < self.src.len) self.src[self.pos] else null;
@@ -135,6 +143,13 @@ pub const Tokenizer = struct {
 
     pub fn next(self: *Tokenizer) !Token {
         self.skipWs();
+        const start = self.pos;
+        var t = try self.scan();
+        t.start = start;
+        return t;
+    }
+
+    fn scan(self: *Tokenizer) !Token {
         if (self.pos >= self.src.len) return .{ .tag = .eof, .text = "" };
         const start = self.pos;
         const c = self.src[self.pos];
@@ -255,6 +270,8 @@ pub fn isIdentStart(c: u8) bool {
 pub fn isIdentCont(c: u8) bool {
     return isIdentStart(c) or (c >= '0' and c <= '9');
 }
+/// Keywords match case-insensitively (`SELECT`, `Where`, `ORDER BY`, `Upper(...)`);
+/// field names keep their exact spelling since the token text is preserved.
 pub fn keywordTag(w: []const u8) ?TokTag {
     const kws = .{
         .{ "select", TokTag.kw_select },           .{ "where", TokTag.kw_where },
@@ -297,8 +314,11 @@ pub fn keywordTag(w: []const u8) ?TokTag {
         .{ "epoch_hour", TokTag.kw_epoch_hour },   .{ "epoch_day", TokTag.kw_epoch_day },
         .{ "epoch_week", TokTag.kw_epoch_week },
     };
+    if (w.len > 13) return null; // longest keyword: "from_epoch_ms"
+    var lower_buf: [13]u8 = undefined;
+    const lower = std.ascii.lowerString(&lower_buf, w);
     inline for (kws) |kw| {
-        if (std.mem.eql(u8, w, kw[0])) return kw[1];
+        if (std.mem.eql(u8, lower, kw[0])) return kw[1];
     }
     return null;
 }

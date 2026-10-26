@@ -13,7 +13,16 @@ A query is a single flat pipeline:
 [scope]  select <fields>  where <expr>  group by <f>  having <expr>  order by <f> asc|desc  limit N  into '<file>'
 ```
 
-Clauses are written in that order (SQL style). Only `select` is required.
+Clauses are usually written in that order (SQL style), but after `select`
+they may come in any order, each at most once (`group by` may also precede
+`select`). Only `select` is required — or just a `where` to filter whole
+records.
+
+Keywords and function names are case-insensitive (`SELECT`, `Where`,
+`ORDER BY`, `Upper(...)`); field names are case-sensitive, like JSON keys.
+Every token must be understood: anything left over — a misspelled clause, a
+missing comma, an unknown function — is a parse error (exit 1), never
+silently ignored.
 
 ---
 
@@ -35,6 +44,7 @@ echo '{"name":"Alice","age":30}' | kqq 'select name'
 | `select distinct f` | Emit each unique value of `f` once |
 | `select expand(arr)` | Unnest an array field into one output row per element |
 | `select <expr> as alias` | Any expression; `as` names the output column |
+| `select f as "my col"` | An alias may be quoted, or be a keyword (`as count`) |
 
 ```bash
 echo '{"a":1,"b":2}' | kqq 'select * add a + b as total'
@@ -115,12 +125,24 @@ cat logs.ndjson | kqq 'select service, count() as n, avg(latency_ms) as p50 grou
 
 | Aggregate | Meaning |
 |---|---|
-| `count()` | Number of records in the group |
+| `count()`, `count(*)`, bare `count` | Number of records in the group |
+| `count(x)` | Number of records where `x` is present and not null |
 | `sum(f)` | Sum of `f` |
 | `avg(f)` | Arithmetic mean of `f` |
 | `min(f)` / `max(f)` | Extremes of `f` |
 | `stddev(f)` | Standard deviation of `f` |
 | `variance(f)` | Variance of `f` |
+
+Aggregates skip null and missing values (`count()` excepted), and their
+argument may be any expression: `sum(price * qty)`, `max(len(name))`.
+Without `as`, an aggregate column is named after the function (`sum`,
+`count`, ...). Aggregate columns appear in SELECT order, after the group keys;
+group keys are always included. `stddev` and `variance` are the population
+forms (DuckDB `stddev_pop` / `var_pop`).
+
+```bash
+kqq 'select region, count(discount) as discounted, sum(price * qty) as revenue group by region'
+```
 
 ### HAVING
 
@@ -163,6 +185,18 @@ echo '{"name":"Alice","salary":100}' | kqq \
 ```
 
 `case when` is the only branching construct — there are no loops or recursion.
+
+A computed column that cannot be evaluated — a missing field, a non-numeric
+operand, division or modulo by zero — is `null`, and the column is still
+emitted; a result too large for a double is printed as `null` as well (JSON
+has no infinity). Unknown function names are a parse error.
+
+### Numbers
+
+Numbers are IEEE doubles for arithmetic and comparison, but values are
+passed through exactly as written: an integer such as `9007199254740993`
+(beyond 2^53) comes out with the same digits. Very large and very small
+magnitudes are printed in exponent form (`1e300`, `1.5e-10`).
 
 ---
 
@@ -260,13 +294,25 @@ kqq "select a into '/tmp/out.json'"
 
 | Flag | Meaning |
 |---|---|
-| *(default)* | NDJSON input (one JSON object per line) |
+| *(default)* | NDJSON input (one JSON object per line; a JSON array with one element per line also works) |
 | `--flat` | Flatten nested JSON to dot-path keys before querying |
 | `--buf` | Buffer entire input (disables streaming) |
 | `--text`, `-T` | Each stdin line is a plain text record (field: `line`) |
 | `--delim <c>` | Delimited input (e.g. `--delim ','`) |
 | `--header` | First delimited row is a header |
 | `--cols <names>` | Column names for delimited input, e.g. `'a,b,c'` |
+
+JSON input is parsed strictly (RFC 8259). In NDJSON input a malformed or
+truncated record — `{"a":2,,}`, a missing closing brace — is skipped and
+reading resumes with the next line; kqq exits 0 and prints
+`kqq: warning: N record(s) skipped (malformed JSON)`. A single JSON document
+(`[scope.*]` queries) that is malformed or truncated is an error (exit 1).
+`\uXXXX` escapes, including surrogate pairs, are decoded to UTF-8.
+
+Delimited input follows RFC 4180 quoting: a field in double quotes may
+contain the delimiter, newlines and doubled quotes (`"Smith, John"`,
+`"say ""hi"""`). Cells that look like plain decimal numbers become numbers
+(quoted or not); an empty unquoted cell is `null`, an empty quoted cell `""`.
 | `--llm <field>` | LLM token accumulation: extract `<field>` from each NDJSON envelope, concatenate fragments, query each completed JSON object in real time |
 | `--llm-path <p>` | Dotted path for nested extraction (e.g. `choices.0.delta.content`) |
 | `--api <preset>` | API protocol preset: `ollama` \| `openai` \| `anthropic` |
@@ -275,8 +321,8 @@ kqq "select a into '/tmp/out.json'"
 
 | Flag | Meaning |
 |---|---|
-| *(default)* | JSON array |
-| `--ndjson` | One JSON object per line |
+| *(default)* | NDJSON: one JSON object per line (`--buf` / `--flat` instead print a single pretty-printed JSON document) |
+| `--ndjson` | NDJSON (the default, made explicit) |
 | `--csv` / `--tsv` | CSV / TSV with header row |
 | `--raw`, `-r` | Bare values, one per line |
 | `--rolling` | Emit rolling aggregate snapshot after each object |
@@ -301,13 +347,16 @@ kqq "select a into '/tmp/out.json'"
 ## Query grammar (informal)
 
 ```
-query      := [scope] select where? group_by? having? order_by? limit? into?
+query      := [scope] [group_by] select clause*      -- each clause at most once, any order
+            | [scope] clause*
+clause     := where | group_by | having | order_by | limit | into
 scope      := '[' path '.*' ']'
-select     := 'select' field (',' field)*
-field      := '*' ('add' expr 'as' ident | 'remove' ident)
-            |  expr ('as' ident)?
-            | 'distinct' ident
-            | 'expand' '(' path ')' ('as' ident)?
+select     := 'select' ['distinct'] field (',' field)* ('add' field | 'remove' ident (',' ident)*)*
+field      := '*'
+            |  expr ('as' alias)?                     -- alias required unless expr is a field
+            | ('count' | 'count' '(' ['*'] ')' | 'count' '(' expr ')') ('as' alias)?
+            | ('sum'|'avg'|'min'|'max'|'stddev'|'variance') '(' expr ')' ('as' alias)?
+            | 'expand' '(' path ')' ('as' alias)?
 where      := 'where' condition (('and'|'or') condition)*
 condition  := ident op value | ident 'between' '[' lo 'and' hi ']'
 group_by   := 'group' 'by' ident

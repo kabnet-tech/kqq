@@ -47,7 +47,7 @@ fn runNDJSON(allocator: std.mem.Allocator, input: []const u8, query_str: []const
     defer q.deinit(allocator);
 
     var writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer allocator.free(writer.writer.buffer);
+    errdefer writer.deinit();
 
     const n = if (q.group_by != null)
         try stream_exec.execGroupByNDJSON(allocator, &r, q, &writer.writer, opts)
@@ -56,7 +56,7 @@ fn runNDJSON(allocator: std.mem.Allocator, input: []const u8, query_str: []const
     else
         try stream_exec.execStreamNDJSON(allocator, &r, q, &writer.writer, opts);
 
-    return .{ .n = n, .out = writer.writer.buffer };
+    return .{ .n = n, .out = try writer.toOwnedSlice() };
 }
 
 /// Run a full scoped-streaming integration test.
@@ -66,7 +66,7 @@ fn runScoped(allocator: std.mem.Allocator, input: []const u8, query_str: []const
     defer q.deinit(allocator);
 
     var writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer allocator.free(writer.writer.buffer);
+    errdefer writer.deinit();
 
     const n = if (q.group_by != null)
         try stream_exec.execGroupByStream(allocator, &r, q, &writer.writer, opts)
@@ -75,7 +75,7 @@ fn runScoped(allocator: std.mem.Allocator, input: []const u8, query_str: []const
     else
         try stream_exec.execStream(allocator, &r, q, &writer.writer, opts);
 
-    return .{ .n = n, .out = writer.writer.buffer };
+    return .{ .n = n, .out = try writer.toOwnedSlice() };
 }
 
 /// Run a full LLM integration test.
@@ -85,7 +85,7 @@ fn runLLM(allocator: std.mem.Allocator, input: []const u8, query_str: []const u8
     defer q.deinit(allocator);
 
     var writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer allocator.free(writer.writer.buffer);
+    errdefer writer.deinit();
 
     const n = if (q.group_by != null)
         try stream_exec.execLlmGroupBy(allocator, &r, q, &writer.writer, opts)
@@ -94,7 +94,7 @@ fn runLLM(allocator: std.mem.Allocator, input: []const u8, query_str: []const u8
     else
         try stream_exec.execLlmStream(allocator, &r, q, &writer.writer, opts);
 
-    return .{ .n = n, .out = writer.writer.buffer };
+    return .{ .n = n, .out = try writer.toOwnedSlice() };
 }
 
 /// Count occurrences of a substring in a string.
@@ -1692,7 +1692,7 @@ fn runText(allocator: std.mem.Allocator, input: []const u8, query_str: []const u
     defer q.deinit(allocator);
 
     var writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer allocator.free(writer.writer.buffer);
+    errdefer writer.deinit();
 
     var src = record_source.TextLineSource.init(allocator, &r);
     defer src.deinit();
@@ -1704,7 +1704,7 @@ fn runText(allocator: std.mem.Allocator, input: []const u8, query_str: []const u
     else
         try stream_exec.execGenericSource(allocator, &src, q, &writer.writer, .{});
 
-    return .{ .n = n, .out = writer.writer.buffer };
+    return .{ .n = n, .out = try writer.toOwnedSlice() };
 }
 
 /// Run a full delimited-mode integration test using DelimitedSource + generic executors.
@@ -1721,7 +1721,7 @@ fn runDelimited(
     defer q.deinit(allocator);
 
     var writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer allocator.free(writer.writer.buffer);
+    errdefer writer.deinit();
 
     var src = record_source.DelimitedSource.init(allocator, &r, delimiter, use_header, explicit_cols);
     defer src.deinit();
@@ -1733,7 +1733,7 @@ fn runDelimited(
     else
         try stream_exec.execGenericSource(allocator, &src, q, &writer.writer, .{});
 
-    return .{ .n = n, .out = writer.writer.buffer };
+    return .{ .n = n, .out = try writer.toOwnedSlice() };
 }
 
 test "integration: text select all lines" {
@@ -2806,9 +2806,8 @@ test "failure: unclosed parenthesis in WHERE is a parse error" {
     try std.testing.expectError(error.UnexpectedToken, err);
 }
 
-// Note: kqq's parser is lenient about trailing tokens after ORDER BY and LIMIT —
-// unknown direction tokens are ignored (defaults to asc) and unknown limit values
-// result in no limit. These are parser design choices, not bugs to test.
+// Trailing tokens are never ignored: see the "review#1" regression tests at
+// the end of this file.
 
 // ── Unicode handling ──────────────────────────────────────────────────────────
 
@@ -3730,4 +3729,318 @@ test "count: group by n = number of groups" {
     const result = try runNDJSON(allocator, data, "select dept, count() group by dept", .{});
     defer allocator.free(result.out);
     try std.testing.expectEqual(@as(usize, 2), result.n);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Regressions from the 2026-10-26 portfolio review ────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Each of these returned a wrong answer with exit code 0 (or hung) before the
+// fix. Outputs are compared exactly, in NDJSON form.
+
+const ndjson_opts = ExecOptions{ .format = .ndjson };
+
+/// Run `query_str` over NDJSON `input` and compare the whole output.
+fn expectNdjson(input: []const u8, query_str: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const result = try runNDJSON(allocator, input, query_str, ndjson_opts);
+    defer allocator.free(result.out);
+    try std.testing.expectEqualStrings(expected, result.out);
+}
+
+fn expectParseError(query_str: []const u8, expected: anyerror) !void {
+    try std.testing.expectError(expected, query.parse(std.testing.allocator, query_str, null));
+}
+
+const AB =
+    \\{"a":1,"b":3}
+    \\{"a":2,"b":10}
+;
+
+test "review#1: keywords are case-insensitive" {
+    try expectNdjson(AB, "select a WHERE b > 5", "{\"a\": 2}\n");
+    try expectNdjson(AB, "SELECT a", "{\"a\": 1}\n{\"a\": 2}\n");
+    try expectNdjson(AB, "select a ORDER BY a DESC LIMIT 1", "{\"a\": 2}\n");
+    try expectNdjson(AB, "Select Upper(\"x\") As u Limit 1", "{\"u\": \"X\"}\n");
+    // Field names keep their case: `A` is not `a`.
+    try expectNdjson(AB, "SELECT A LIMIT 1", "{\"A\": null}\n");
+}
+
+test "review#1: unparsed trailing tokens are an error" {
+    try expectParseError("select a where b > 5 garbage", error.UnexpectedToken);
+    try expectParseError("select a b", error.UnexpectedToken);
+    try expectParseError("select a order by a desc sideways", error.UnexpectedToken);
+    try expectParseError("select a limit 1 limit 2", error.UnexpectedToken);
+    try expectParseError("select a where a = 1 where a = 2", error.UnexpectedToken);
+    try expectParseError("select upper(a)", error.UnexpectedToken); // alias required
+    try expectParseError("select foo(a) as x", error.UnknownFunction);
+    try expectParseError("select a where foo(a) > 1", error.UnknownFunction);
+    try expectParseError("select sum(a b) as s", error.UnexpectedToken);
+}
+
+test "review#1: error position points at the trailing token" {
+    var pos: usize = 0;
+    try std.testing.expectError(error.UnexpectedToken, query.parse(std.testing.allocator, "select a where b > 5 garbage", &pos));
+    try std.testing.expectEqual(@as(usize, 21), pos);
+    try std.testing.expectError(error.UnknownFunction, query.parse(std.testing.allocator, "select a, nope(b) as c", &pos));
+    try std.testing.expectEqual(@as(usize, 10), pos);
+}
+
+test "review#1: clauses after SELECT may come in any order" {
+    const data =
+        \\{"d":"x"}
+        \\{"d":"y"}
+        \\{"d":"y"}
+    ;
+    try expectNdjson(data, "select d, count() as n group by d having n > 0 order by n desc", "{\"d\": \"y\", \"n\": 2}\n{\"d\": \"x\", \"n\": 1}\n");
+    try expectNdjson(data, "select d, count() as n group by d order by n desc having n > 1", "{\"d\": \"y\", \"n\": 2}\n");
+    try expectNdjson(data, "select d limit 1 where d = \"y\"", "{\"d\": \"y\"}\n");
+}
+
+test "review#1: computed expressions in more places" {
+    try expectNdjson(AB, "select a - 1 as x, a -1 as y, (a + b) * 2 as z limit 1", "{\"x\": 0, \"y\": 0, \"z\": 8}\n");
+    try expectNdjson(AB, "select a where a + b * 2 > 8", "{\"a\": 2}\n");
+    try expectNdjson(AB, "select round(b / 3, 1) * 2 as r limit 1", "{\"r\": 2}\n");
+    try expectNdjson(AB, "select ifhas(a, \"y\", \"n\") as h, ifhas(zz, \"y\", \"n\") as h2 limit 1", "{\"h\": \"y\", \"h2\": \"n\"}\n");
+    // keyword-named fields work as operands and aggregate inputs
+    try expectNdjson("{\"desc\":5,\"type\":\"t\"}", "select desc + 1 as c, upper(type) as u", "{\"c\": 6, \"u\": \"T\"}\n");
+    try expectNdjson("{\"count\":5}\n{\"count\":7}", "select sum(count) as s", "{\"s\": 12}\n");
+}
+
+test "review#2: truncated record followed by a good one is skipped, not a hang" {
+    const allocator = std.testing.allocator;
+    const data = "{\"a\":1\n{\"a\":2}\n";
+    // (`where a > 0` keeps the raw-byte fast path: the truncated line passes the
+    // filter, so it is validated before being emitted — and skipped.)
+    const queries = [_][]const u8{ "select a", "where a > 0", "select a, count() group by a", "select count(), sum(a)" };
+    const expected = [_][]const u8{
+        "{\"a\": 2}\n",
+        "{\"a\":2}\n",
+        "{\"a\": 2, \"count\": 1}\n",
+        "{\"count\": 1, \"sum\": 2}\n",
+    };
+    for (queries, expected) |q, want| {
+        var skipped: usize = 0;
+        var opts = ndjson_opts;
+        opts.skipped_records = &skipped;
+        const result = try runNDJSON(allocator, data, q, opts);
+        defer allocator.free(result.out);
+        try std.testing.expectEqualStrings(want, result.out);
+        try std.testing.expectEqual(@as(usize, 1), skipped);
+    }
+}
+
+test "review#2: truncated final record and truncated scoped document" {
+    const allocator = std.testing.allocator;
+    var skipped: usize = 0;
+    var opts = ndjson_opts;
+    opts.skipped_records = &skipped;
+    const result = try runNDJSON(allocator, "{\"a\":1}\n{\"a\":2", "select a, count() group by a", opts);
+    defer allocator.free(result.out);
+    try std.testing.expectEqualStrings("{\"a\": 1, \"count\": 1}\n", result.out);
+    try std.testing.expectEqual(@as(usize, 1), skipped);
+    // A single document cannot be partially recovered: truncation is an error.
+    try std.testing.expectError(error.UnexpectedEof, runScoped(allocator, "{\"users\":[{\"a\":1},{\"a\":2", "[users.*] select a", .{}));
+}
+
+test "review#2: malformed records are rejected, the rest still read" {
+    const bad = [_][]const u8{ "{\"a\":2,,}", "{\"a\":2,}", "{\"a\" 2}", "{\"a\":[1,]}", "{\"a\":01}", "{\"a\":\"x\\q\"}", "{\"a\":2}}" };
+    for (bad) |line| {
+        const allocator = std.testing.allocator;
+        const data = try std.mem.concat(allocator, u8, &.{ line, "\n{\"a\":7}\n" });
+        defer allocator.free(data);
+        for ([_][]const u8{ "select a", "where a > 0", "select sum(a) as s", "select a, count() group by a" }) |q| {
+            var skipped: usize = 0;
+            var opts = ndjson_opts;
+            opts.skipped_records = &skipped;
+            const result = try runNDJSON(allocator, data, q, opts);
+            defer allocator.free(result.out);
+            try std.testing.expect(std.mem.indexOf(u8, result.out, "7") != null);
+            try std.testing.expect(std.mem.indexOf(u8, result.out, "2") == null);
+            try std.testing.expectEqual(@as(usize, 1), skipped);
+        }
+    }
+}
+
+test "review#3: RFC 4180 quoted CSV fields" {
+    const allocator = std.testing.allocator;
+    const csv = "name,amt\n\"Smith, John\",100\nBob,50\n\"Al \"\"The Pal\"\"\",55\nCy,100\n";
+    const agg = try runDelimited(allocator, csv, "select count(), sum(amt)", ',', true, null);
+    defer allocator.free(agg.out);
+    try std.testing.expect(std.mem.indexOf(u8, agg.out, "\"count\": 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agg.out, "\"sum\": 305") != null);
+
+    const names = try runDelimited(allocator, csv, "select name where amt > 52", ',', true, null);
+    defer allocator.free(names.out);
+    try std.testing.expect(std.mem.indexOf(u8, names.out, "\"Smith, John\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, names.out, "\"Al \\\"The Pal\\\"\"") != null);
+
+    // A quoted field may contain newlines; header names may be quoted; an
+    // empty quoted field is "" while an empty unquoted one is null.
+    const multi = try runDelimited(allocator, "\"note\",\"n\",\"e\"\n\"line one\nline two\",1,\"\"\nplain,2,\n", "select note, n, e", ',', true, null);
+    defer allocator.free(multi.out);
+    try std.testing.expectEqual(@as(usize, 2), multi.n);
+    try std.testing.expect(std.mem.indexOf(u8, multi.out, "\"note\": \"line one\\nline two\", \"n\": 1, \"e\": \"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi.out, "\"note\": \"plain\", \"n\": 2, \"e\": null") != null);
+}
+
+test "review#3: an unterminated quoted CSV field at end of input keeps its text" {
+    const allocator = std.testing.allocator;
+    const result = try runDelimited(allocator, "a,b\n1,\"open\nmore", "select a, b", ',', true, null);
+    defer allocator.free(result.out);
+    try std.testing.expect(std.mem.indexOf(u8, result.out, "\"a\": 1, \"b\": \"open\\nmore\"") != null);
+}
+
+test "review#3: CSV numbers are inferred strictly" {
+    const allocator = std.testing.allocator;
+    const result = try runDelimited(allocator, "nan,inf,0x10,1_000,\"42\",-1.5e3,007\n", "select f1, f2, f3, f4, f5, f6, f7", ',', false, null);
+    defer allocator.free(result.out);
+    try std.testing.expect(std.mem.indexOf(u8, result.out, "\"f1\": \"nan\", \"f2\": \"inf\", \"f3\": \"0x10\", \"f4\": \"1_000\", \"f5\": 42, \"f6\": -1500, \"f7\": 7") != null);
+}
+
+test "review#3: delimited and text sources read lines longer than the reader buffer" {
+    // Regression: a line > 64 KiB ended the input silently.
+    const allocator = std.testing.allocator;
+    const long = try allocator.alloc(u8, 100_000);
+    defer allocator.free(long);
+    @memset(long, 'x');
+    const input = try std.mem.concat(allocator, u8, &.{ "name,n\n", long, ",1\nb,2\n" });
+    defer allocator.free(input);
+    // A small reader buffer (the CLI uses 64 KiB) to force the long-line path.
+    var buf: [4096]u8 = undefined;
+    var tr: std.testing.Reader = .init(&buf, &.{.{ .buffer = input }});
+    var src = record_source.DelimitedSource.init(allocator, &tr.interface, ',', true, null);
+    defer src.deinit();
+    var rows: usize = 0;
+    var total: f64 = 0;
+    while (try src.next()) |rec_val| {
+        var rec = rec_val;
+        defer rec.deinit();
+        rows += 1;
+        total += rec.get("n").?.number.f;
+        if (rows == 1) try std.testing.expectEqual(@as(usize, 100_000), rec.get("name").?.string.len);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows);
+    try std.testing.expectEqual(@as(f64, 3), total);
+
+    var tr2: std.testing.Reader = .init(&buf, &.{.{ .buffer = input }});
+    var text = record_source.TextLineSource.init(allocator, &tr2.interface);
+    defer text.deinit();
+    var lines: usize = 0;
+    while (try text.next()) |rec_val| {
+        var rec = rec_val;
+        rec.deinit();
+        lines += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), lines);
+}
+
+test "review#4: \\u escapes decode, keys and nested strings round-trip" {
+    try expectNdjson("{\"n\":\"caf\\u00e9\",\"e\":\"\\ud83d\\ude00\"}", "select n, e", "{\"n\": \"café\", \"e\": \"😀\"}\n");
+    try expectNdjson("{\"n\":\"caf\\u00e9\"}\n{\"n\":\"cafe\"}", "select n where n = \"café\"", "{\"n\": \"café\"}\n");
+    try expectNdjson("{\"caf\\u00e9\":1}", "select *", "{\"café\": 1}\n");
+    // Nested objects/arrays are re-serialised: strings must be re-escaped.
+    try expectNdjson("{\"o\":{\"s\":\"a\\\"b\\\\c\",\"t\":[\"q\\\"\"]}}", "select o", "{\"o\": {\"s\": \"a\\\"b\\\\c\", \"t\": [\"q\\\"\"]}}\n");
+}
+
+test "review#4: escaped keys are not missed by the raw-byte WHERE fast path" {
+    // `"\u0061"` is the key `a`: raw bytes can't tell, so the record is parsed.
+    try expectNdjson("{\"\\u0061\":5}\n{\"a\":6}", "where a = 5", "{\"\\u0061\":5}\n");
+    try expectNdjson("{\"\\u0061\":5}", "select a where a is not null", "{\"a\": 5}\n");
+}
+
+test "review#4: arrays of objects serialise as valid JSON" {
+    // Regression (found alongside #4): `[{"a":1,"b":2}]` used to come out as
+    // `[{"a": , 1"b": , 2}]`.
+    try expectNdjson("{\"x\":[{\"a\":1,\"b\":2},[3,{\"c\":[]}]],\"y\":{\"z\":[{\"q\":1}]}}", "select x, y", "{\"x\": [{\"a\": 1, \"b\": 2}, [3, {\"c\": []}]], \"y\": {\"z\": [{\"q\": 1}]}}\n");
+}
+
+test "review#5: exact integers and large magnitudes survive" {
+    try expectNdjson("{\"i\":9007199254740993}\n{\"i\":12345678901234567890}\n{\"i\":-9007199254740993}", "select i", "{\"i\": 9007199254740993}\n{\"i\": 12345678901234567890}\n{\"i\": -9007199254740993}\n");
+    try expectNdjson("{\"f\":1e300,\"g\":1.5e-10,\"h\":-2.5E+21}", "select f, g, h, f * 2 as d", "{\"f\": 1e300, \"g\": 1.5e-10, \"h\": -2.5e21, \"d\": 2e300}\n");
+    try expectNdjson("{\"a\":0.1,\"b\":3.14159,\"c\":-5,\"d\":100,\"e\":1e20,\"z\":-0}", "select a, b, c, d, e, z", "{\"a\": 0.1, \"b\": 3.14159, \"c\": -5, \"d\": 100, \"e\": 100000000000000000000, \"z\": -0}\n");
+    try expectNdjson("{\"o\":{\"i\":9007199254740993,\"f\":1e300},\"a\":[9007199254740993]}", "select o, a, a.0 as first", "{\"o\": {\"i\": 9007199254740993, \"f\": 1e300}, \"a\": [9007199254740993], \"first\": 9007199254740993}\n");
+    // Big integer group keys stay distinct.
+    const allocator = std.testing.allocator;
+    const result = try runNDJSON(allocator, "{\"id\":9007199254740993}\n{\"id\":9007199254740992}\n{\"id\":9007199254740993}", "select id, count() group by id order by count desc", ndjson_opts);
+    defer allocator.free(result.out);
+    try std.testing.expectEqualStrings("{\"id\": 9007199254740993, \"count\": 2}\n{\"id\": 9007199254740992, \"count\": 1}\n", result.out);
+}
+
+test "review#6: count(expr) and aggregates over expressions" {
+    const allocator = std.testing.allocator;
+    const dv =
+        \\{"d":"x","v":1}
+        \\{"d":"x","v":2}
+        \\{"d":"y","v":3}
+    ;
+    for ([_][]const u8{
+        "select count(v) as n group by d order by d",
+        "select d, count(v) as n group by d order by d",
+    }) |q| {
+        const result = try runNDJSON(allocator, dv, q, ndjson_opts);
+        defer allocator.free(result.out);
+        try std.testing.expectEqualStrings("{\"d\": \"x\", \"n\": 2}\n{\"d\": \"y\", \"n\": 1}\n", result.out);
+    }
+    try expectNdjson(dv, "select d, sum(v * 2) as s, max(v + 10) as m group by d order by d", "{\"d\": \"x\", \"s\": 6, \"m\": 12}\n{\"d\": \"y\", \"s\": 6, \"m\": 13}\n");
+    try expectNdjson(dv, "select avg(v * 10) as a, count(v) as n", "{\"a\": 20, \"n\": 3}\n");
+    try expectNdjson(dv, "select count(v), SUM(v)", "{\"count\": 3, \"sum\": 6}\n");
+    // count(x) counts non-null values; count() counts rows; several may coexist.
+    try expectNdjson("{\"v\":1}\n{\"v\":null}\n{}\n{\"v\":\"s\"}", "select count(v) as n, count() as c, count(*) as c2, sum(v) as s", "{\"n\": 2, \"c\": 4, \"c2\": 4, \"s\": 1}\n");
+    // Aggregate columns come out in SELECT order.
+    try expectNdjson(dv, "select d, avg(v) as a, count() as c group by d order by d", "{\"d\": \"x\", \"a\": 1.5, \"c\": 2}\n{\"d\": \"y\", \"a\": 3, \"c\": 1}\n");
+}
+
+test "review#7: DISTINCT applies before LIMIT" {
+    const dups =
+        \\{"a":1}
+        \\{"a":1}
+        \\{"a":1}
+        \\{"a":2}
+        \\{"a":3}
+        \\{"a":4}
+    ;
+    try expectNdjson(dups, "select distinct a limit 3", "{\"a\": 1}\n{\"a\": 2}\n{\"a\": 3}\n");
+    try expectNdjson(dups, "select distinct a order by a desc limit 2", "{\"a\": 4}\n{\"a\": 3}\n");
+    try expectNdjson("{\"a\":1}\n{\"a\":\"1\"}\n{\"a\":1}", "select distinct a", "{\"a\": 1}\n{\"a\": \"1\"}\n");
+
+    const allocator = std.testing.allocator;
+    const csv_out = try runNDJSON(allocator, dups, "select distinct a limit 2", .{ .format = .csv });
+    defer allocator.free(csv_out.out);
+    try std.testing.expectEqualStrings("a\n1\n2\n", csv_out.out);
+
+    const scoped = try runScoped(allocator, "{\"r\":[{\"a\":1},{\"a\":1},{\"a\":2},{\"a\":3}]}", "[r.*] select distinct a limit 2", ndjson_opts);
+    defer allocator.free(scoped.out);
+    try std.testing.expectEqualStrings("{\"a\": 1}\n{\"a\": 2}\n", scoped.out);
+
+    const text = try runText(allocator, "x\nx\ny\nz\n", "select distinct line limit 2");
+    defer allocator.free(text.out);
+    try std.testing.expectEqual(@as(usize, 2), text.n);
+
+    // LIMIT counts output rows under EXPAND too.
+    try expectNdjson("{\"arr\":[1,2,3]}\n{\"arr\":[4]}", "select expand(arr) as v limit 2", "{\"v\": 1}\n{\"v\": 2}\n");
+}
+
+test "review#8: division and modulo by zero yield null, column kept" {
+    try expectNdjson("{\"a\":1,\"b\":0}", "select a, a / 0 as q, a / b as r, a % 0 as m", "{\"a\": 1, \"q\": null, \"r\": null, \"m\": null}\n");
+    try expectNdjson("{\"a\":1,\"b\":0}\n{\"a\":4,\"b\":2}", "select a where (a / b) is null", "{\"a\": 1}\n");
+    // Overflow to infinity is emitted as null too (JSON has no Infinity).
+    try expectNdjson("{\"a\":1e308}", "select a * 10 as big", "{\"big\": null}\n");
+}
+
+test "review: parse errors free everything (no leaks)" {
+    // std.testing.allocator fails the test on any leak.
+    const bad = [_][]const u8{
+        "select a, b + c as d, case when x > 1 then 2 end as e, sum(f * 2) as g where h = 1 garbage",
+        "select upper(a) as u, count(b) as n group by c having n > 1 order by n limit",
+        "[r.*] select isnull(a, \"x\") as y, expand(split(s, \",\")) as p where (a + 1) > 2 into",
+        "select a where (b = 1 or c = 2) and not (d = 3) and e in ('x') and f between [1 and",
+        "select concat(a, nope(b)) as c",
+    };
+    for (bad) |q| {
+        if (query.parse(std.testing.allocator, q, null)) |parsed| {
+            parsed.deinit(std.testing.allocator);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }

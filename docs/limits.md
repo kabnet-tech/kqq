@@ -46,5 +46,8 @@ These are the mistakes the parser will catch, collected from real usage:
 - **IN lists use parentheses with quoted strings** — `in ('a', 'b')`, not
   square brackets.
 - **`between` uses square brackets** — `between [lo and hi]`.
-- **Unknown functions silently return `null`** — there's no error to tip you
-  off; check spelling against the [SQL reference](KQQ-SQL-REFERENCE.md).
+- **Unknown functions are a parse error** — `select foo(x) as y` fails with
+  `unknown function 'foo'`; check spelling against the
+  [SQL reference](KQQ-SQL-REFERENCE.md).
+- **Nothing is silently ignored** — a misspelled clause, a missing comma or a
+  stray word after the query is a parse error, not a partially-run query.

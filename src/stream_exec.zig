@@ -39,6 +39,8 @@ const globLike = regex.globLike;
 
 // Re-export record types for backward compatibility (record_source.zig, main.zig, etc.)
 pub const OwnedValue = record_mod.OwnedValue;
+pub const Number = record_mod.Number;
+pub const isJsonNumber = stream.isJsonNumber;
 pub const Record = record_mod.Record;
 pub const PATH_SEP = record_mod.PATH_SEP;
 const copyRecord = record_mod.copyRecord;
@@ -81,7 +83,6 @@ const extractNestedField = llm_mod.extractNestedField;
 const validateSchema = llm_mod.validateSchema;
 const extractNextObject = llm_mod.extractNextObject;
 const drainAccum = llm_mod.drainAccum;
-const emitAggSnapshot = llm_mod.emitAggSnapshot;
 const emitGroupBySnapshot = llm_mod.emitGroupBySnapshot;
 const writeOneJsonRecord = llm_mod.writeOneJsonRecord;
 
@@ -189,20 +190,11 @@ fn projectRecord(
         if (f.expr) |e| {
             const out_key = try allocator.dupe(u8, if (f.alias) |a| a else f.key);
             errdefer allocator.free(out_key);
-            // evalExpr already allocates strings into `allocator` — take ownership directly
-            const val = evalExpr(allocator, src, e) orelse {
-                allocator.free(out_key);
-                continue;
-            };
-            const out_val: OwnedValue = switch (val) {
-                // strings/raws already owned by `allocator` — no second dupe needed
-                .string => |s| .{ .string = s },
-                .number => |n| .{ .number = n },
-                .boolean => |b| .{ .boolean = b },
-                .null_val => .null_val,
-                .raw => |r| .{ .raw = r },
-            };
-            try out.fields.put(allocator, out_key, out_val);
+            // evalExpr already allocates into `allocator` — take ownership directly.
+            // An expression that cannot be evaluated (missing field, type
+            // mismatch) is SQL NULL: the column is still emitted, as `null`.
+            const val = evalExpr(allocator, src, e) orelse .null_val;
+            try out.fields.put(allocator, out_key, val);
             continue;
         }
         const ov_opt = src.get(f.key);
@@ -248,91 +240,116 @@ fn collectRecord(
 
 /// Recursively collect a JSON object (opening `{` already consumed) into `rec`.
 /// `prefix` is the dot path to prepend to each key (empty string at the top level).
+/// The scanner guarantees well-formed structure, so inside an object only keys
+/// and the closing brace can appear; malformed or truncated input surfaces as
+/// a scanner error rather than an unexpected event.
 fn collectObjectInto(
     allocator: std.mem.Allocator,
     sc: anytype,
     rec: *Record,
     prefix: []const u8,
 ) !void {
-    field_loop: while (true) {
+    while (true) {
         const ev = try sc.next();
-        switch (ev) {
-            .object_end => break :field_loop,
-            .key => |k| {
-                // Build the full path key: prefix + PATH_SEP + k  (or just k at root).
-                // PATH_SEP ('\x1f') is used instead of '.' so that JSON keys that
-                // literally contain dots (e.g. {"svc.metric": 1}) are stored as-is
-                // and do not collide with nested-path keys.
-                const full_key: []u8 = if (prefix.len == 0)
-                    try allocator.dupe(u8, k)
-                else
-                    try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, PATH_SEP, k });
-                errdefer allocator.free(full_key);
+        const k = switch (ev) {
+            .object_end => return,
+            .key => |k| k,
+            else => return error.BadJson,
+        };
+        // Build the full path key: prefix + PATH_SEP + k  (or just k at root).
+        // PATH_SEP ('\x1f') is used instead of '.' so that JSON keys that
+        // literally contain dots (e.g. {"svc.metric": 1}) are stored as-is
+        // and do not collide with nested-path keys.
+        const full_key: []u8 = if (prefix.len == 0)
+            try allocator.dupe(u8, k)
+        else
+            try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, PATH_SEP, k });
+        errdefer allocator.free(full_key);
 
-                const vev = try sc.next();
-                switch (vev) {
-                    .object_start => {
-                        // Store the whole nested object as `.raw` for output fidelity,
-                        // AND recurse to populate flattened dot-path keys for querying.
-                        var raw_buf = std.array_list.Managed(u8).init(allocator);
-                        errdefer raw_buf.deinit();
-                        try raw_buf.append('{');
-                        // We need to iterate child events both for raw and for recursion.
-                        // Strategy: collect child field events, build raw, and also insert
-                        // dot-path keys for scalar leaves.
-                        try collectNestedObject(allocator, sc, rec, full_key, &raw_buf);
-                        const raw_bytes = try raw_buf.toOwnedSlice();
-                        try rec.fields.put(allocator, full_key, .{ .raw = raw_bytes });
-                    },
-                    .array_start => {
-                        // Arrays: store as raw only (no nested array element querying yet)
-                        var raw_buf = std.array_list.Managed(u8).init(allocator);
-                        errdefer raw_buf.deinit();
-                        try raw_buf.append('[');
-                        try collectRawArray(sc, &raw_buf);
-                        const raw_bytes = try raw_buf.toOwnedSlice();
-                        // Also store indexed entries key\x1f0, key\x1f1, ... for direct access
-                        if (std.json.parseFromSlice(std.json.Value, allocator, raw_bytes, .{})) |parsed| {
-                            defer parsed.deinit();
-                            if (parsed.value == .array) {
-                                for (parsed.value.array.items, 0..) |elem, idx| {
-                                    const idx_key = try std.fmt.allocPrint(allocator, "{s}{c}{d}", .{ full_key, PATH_SEP, idx });
-                                    errdefer allocator.free(idx_key);
-                                    const idx_val: OwnedValue = switch (elem) {
-                                        .string => |s| .{ .string = try allocator.dupe(u8, s) },
-                                        .integer => |n| .{ .number = @floatFromInt(n) },
-                                        .float => |f2| .{ .number = f2 },
-                                        .bool => |b| .{ .boolean = b },
-                                        .null => .null_val,
-                                        else => v: {
-                                            var aw = std.Io.Writer.Allocating.init(allocator);
-                                            errdefer aw.deinit();
-                                            try std.json.Stringify.value(elem, .{}, &aw.writer);
-                                            break :v OwnedValue{ .raw = try aw.toOwnedSlice() };
-                                        },
-                                    };
-                                    try rec.fields.put(allocator, idx_key, idx_val);
-                                }
-                            }
-                        } else |_| {} // ignore parse errors — still store raw
-                        try rec.fields.put(allocator, full_key, .{ .raw = raw_bytes });
-                    },
-                    .string => |s| try rec.fields.put(allocator, full_key, .{ .string = try allocator.dupe(u8, s) }),
-                    .number => |n| try rec.fields.put(allocator, full_key, .{ .number = n }),
-                    .boolean => |b| try rec.fields.put(allocator, full_key, .{ .boolean = b }),
-                    .null_val => try rec.fields.put(allocator, full_key, .null_val),
-                    else => allocator.free(full_key), // unexpected — release key
-                }
+        const vev = try sc.next();
+        switch (vev) {
+            .object_start => {
+                // Store the whole nested object as `.raw` for output fidelity,
+                // AND recurse to populate flattened dot-path keys for querying.
+                var raw_buf = std.array_list.Managed(u8).init(allocator);
+                errdefer raw_buf.deinit();
+                try raw_buf.append('{');
+                try collectNestedObject(allocator, sc, rec, full_key, &raw_buf);
+                const raw_bytes = try raw_buf.toOwnedSlice();
+                try rec.fields.put(allocator, full_key, .{ .raw = raw_bytes });
             },
-            else => {}, // unexpected — skip
+            .array_start => {
+                // Arrays: store raw, plus indexed entries key\x1f0, key\x1f1, ...
+                var raw_buf = std.array_list.Managed(u8).init(allocator);
+                errdefer raw_buf.deinit();
+                try raw_buf.append('[');
+                try collectRawArray(sc, &raw_buf);
+                const raw_bytes = try raw_buf.toOwnedSlice();
+                if (std.json.parseFromSlice(std.json.Value, allocator, raw_bytes, .{})) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value == .array) {
+                        for (parsed.value.array.items, 0..) |elem, idx| {
+                            const idx_key = try std.fmt.allocPrint(allocator, "{s}{c}{d}", .{ full_key, PATH_SEP, idx });
+                            errdefer allocator.free(idx_key);
+                            try rec.fields.put(allocator, idx_key, try ownedFromJson(allocator, elem));
+                        }
+                    }
+                } else |_| {} // raw_buf is valid JSON by construction; nothing to index otherwise
+                try rec.fields.put(allocator, full_key, .{ .raw = raw_bytes });
+            },
+            .string => |sv| try rec.fields.put(allocator, full_key, .{ .string = try allocator.dupe(u8, sv) }),
+            .number => |n| try rec.fields.put(allocator, full_key, .{ .number = try Number.fromLiteral(allocator, n.value, n.text) }),
+            .boolean => |b| try rec.fields.put(allocator, full_key, .{ .boolean = b }),
+            .null_val => try rec.fields.put(allocator, full_key, .null_val),
+            else => return error.BadJson,
         }
+    }
+}
+
+/// Convert a std.json value (an array element) into an owned field value.
+/// Integers that an f64 cannot hold exactly keep their literal text.
+fn ownedFromJson(allocator: std.mem.Allocator, v: std.json.Value) !OwnedValue {
+    return switch (v) {
+        .string => |sv| .{ .string = try allocator.dupe(u8, sv) },
+        .integer => |n| blk: {
+            var tmp: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+            break :blk .{ .number = try Number.fromLiteral(allocator, @floatFromInt(n), text) };
+        },
+        .float => |f| OwnedValue.num(f),
+        .number_string => |text| .{ .number = try Number.fromLiteral(
+            allocator,
+            std.fmt.parseFloat(f64, text) catch std.math.nan(f64),
+            text,
+        ) },
+        .bool => |b| .{ .boolean = b },
+        .null => .null_val,
+        .array, .object => blk: {
+            var aw = std.Io.Writer.Allocating.init(allocator);
+            errdefer aw.deinit();
+            try std.json.Stringify.value(v, .{}, &aw.writer);
+            break :blk .{ .raw = try aw.toOwnedSlice() };
+        },
+    };
+}
+
+/// Append a scalar event to a raw JSON buffer: strings re-escaped, numbers by
+/// their source text (exact, and never reformatted).
+fn appendRawScalar(buf: *std.array_list.Managed(u8), ev: stream.Event) !void {
+    switch (ev) {
+        .string => |sv| try appendJsonStr(buf, sv),
+        .number => |n| try buf.appendSlice(n.text),
+        .boolean => |b| try buf.appendSlice(if (b) "true" else "false"),
+        .null_val => try buf.appendSlice("null"),
+        else => unreachable,
     }
 }
 
 /// Collect a nested object that was already entered (opening `{` consumed).
 /// Simultaneously:
 ///   - appends raw JSON bytes to `raw_buf` (for output)
-///   - inserts flattened dot-path entries into `rec` for scalar leaves
+///   - inserts flattened dot-path entries into `rec` for every member; nested
+///     objects and arrays are also stored whole as `.raw`
 /// The full_key for the object itself is inserted by the caller after we return.
 fn collectNestedObject(
     allocator: std.mem.Allocator,
@@ -344,166 +361,54 @@ fn collectNestedObject(
     var first = true;
     while (true) {
         const ev = try sc.next();
-        switch (ev) {
+        const k = switch (ev) {
             .object_end => {
                 try raw_buf.append('}');
                 return;
             },
-            .key => |k| {
-                if (!first) try raw_buf.appendSlice(", ");
-                first = false;
-                try raw_buf.append('"');
-                try raw_buf.appendSlice(k);
-                try raw_buf.appendSlice("\": ");
+            .key => |k| k,
+            else => return error.BadJson,
+        };
+        if (!first) try raw_buf.appendSlice(", ");
+        first = false;
+        try appendJsonStr(raw_buf, k);
+        try raw_buf.appendSlice(": ");
 
-                const child_key = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, PATH_SEP, k });
-                errdefer allocator.free(child_key);
+        const child_key = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, PATH_SEP, k });
+        errdefer allocator.free(child_key);
 
-                const vev = try sc.next();
-                switch (vev) {
-                    .object_start => {
-                        // Write '{' into both the parent raw_buf and a separate snapshot
-                        // so we can store the nested object as its own .raw value.
-                        var snap = std.array_list.Managed(u8).init(allocator);
-                        defer snap.deinit();
-                        try snap.append('{');
-                        try raw_buf.append('{');
-                        // Recurse writing into *both* raw_buf and snap in sync.
-                        // We use a two-writer helper to keep them in lockstep.
-                        try collectNestedObjectDual(allocator, sc, rec, child_key, raw_buf, &snap);
-                        try rec.fields.put(allocator, child_key, .{ .raw = try snap.toOwnedSlice() });
-                    },
-                    .array_start => {
-                        // Capture the array raw for both output and storage.
-                        var snap = std.array_list.Managed(u8).init(allocator);
-                        errdefer snap.deinit();
-                        try snap.append('[');
-                        try raw_buf.append('[');
-                        // Collect into snap; mirror into raw_buf by re-appending snap's new bytes.
-                        const before = raw_buf.items.len;
-                        try collectRawArray(sc, &snap);
-                        // snap now has the full "[...]", append the part after '[' to raw_buf
-                        try raw_buf.appendSlice(snap.items[1..]);
-                        _ = before;
-                        try rec.fields.put(allocator, child_key, .{ .raw = try snap.toOwnedSlice() });
-                    },
-                    .string => |s| {
-                        try raw_buf.append('"');
-                        try raw_buf.appendSlice(s);
-                        try raw_buf.append('"');
-                        try rec.fields.put(allocator, child_key, .{ .string = try allocator.dupe(u8, s) });
-                    },
-                    .number => |n| {
-                        var tmp: [32]u8 = undefined;
-                        const ns = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch "0";
-                        try raw_buf.appendSlice(ns);
-                        try rec.fields.put(allocator, child_key, .{ .number = n });
-                    },
-                    .boolean => |b| {
-                        try raw_buf.appendSlice(if (b) "true" else "false");
-                        try rec.fields.put(allocator, child_key, .{ .boolean = b });
-                    },
-                    .null_val => {
-                        try raw_buf.appendSlice("null");
-                        try rec.fields.put(allocator, child_key, .null_val);
-                    },
-                    else => allocator.free(child_key),
+        const vev = try sc.next();
+        switch (vev) {
+            .object_start, .array_start => {
+                // Write the child into the parent's raw output, then keep a
+                // copy of just the child's bytes as its own `.raw` value.
+                const start = raw_buf.items.len;
+                if (vev == .object_start) {
+                    try raw_buf.append('{');
+                    try collectNestedObject(allocator, sc, rec, child_key, raw_buf);
+                } else {
+                    try raw_buf.append('[');
+                    try collectRawArray(sc, raw_buf);
                 }
+                try rec.fields.put(allocator, child_key, .{ .raw = try allocator.dupe(u8, raw_buf.items[start..]) });
             },
-            else => {},
-        }
-    }
-}
-
-/// Like collectNestedObject but writes simultaneously into two buffers:
-/// `out_buf` (the parent's raw output) and `snap` (a snapshot for storing as .raw).
-/// Both buffers must already have '{' appended before calling.
-fn collectNestedObjectDual(
-    allocator: std.mem.Allocator,
-    sc: anytype,
-    rec: *Record,
-    prefix: []const u8,
-    out_buf: *std.array_list.Managed(u8),
-    snap: *std.array_list.Managed(u8),
-) !void {
-    var first = true;
-    while (true) {
-        const ev = try sc.next();
-        switch (ev) {
-            .object_end => {
-                try out_buf.append('}');
-                try snap.append('}');
-                return;
+            .string => |sv| {
+                try appendRawScalar(raw_buf, vev);
+                try rec.fields.put(allocator, child_key, .{ .string = try allocator.dupe(u8, sv) });
             },
-            .key => |k| {
-                if (!first) {
-                    try out_buf.appendSlice(", ");
-                    try snap.appendSlice(", ");
-                }
-                first = false;
-                const key_json_prefix = try std.fmt.allocPrint(allocator, "\"{s}\": ", .{k});
-                defer allocator.free(key_json_prefix);
-                try out_buf.appendSlice(key_json_prefix);
-                try snap.appendSlice(key_json_prefix);
-
-                const child_key = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, PATH_SEP, k });
-                errdefer allocator.free(child_key);
-
-                const vev = try sc.next();
-                switch (vev) {
-                    .object_start => {
-                        try out_buf.append('{');
-                        try snap.append('{');
-                        var child_snap = std.array_list.Managed(u8).init(allocator);
-                        defer child_snap.deinit();
-                        try child_snap.append('{');
-                        // Recurse: write into out_buf and child_snap simultaneously.
-                        // We use a simple wrapper: collect into child_snap, then mirror to out_buf.
-                        // But that loses simultaneity — instead recurse with out_buf + child_snap.
-                        try collectNestedObjectDual(allocator, sc, rec, child_key, out_buf, &child_snap);
-                        // out_buf already has the full child object appended (including '}').
-                        // snap needs child_snap's content after the '{' we already wrote.
-                        try snap.appendSlice(child_snap.items[1..]);
-                        try rec.fields.put(allocator, child_key, .{ .raw = try child_snap.toOwnedSlice() });
-                    },
-                    .array_start => {
-                        var arr_snap = std.array_list.Managed(u8).init(allocator);
-                        errdefer arr_snap.deinit();
-                        try arr_snap.append('[');
-                        try collectRawArray(sc, &arr_snap);
-                        try out_buf.appendSlice(arr_snap.items);
-                        try snap.appendSlice(arr_snap.items);
-                        try rec.fields.put(allocator, child_key, .{ .raw = try arr_snap.toOwnedSlice() });
-                    },
-                    .string => |s| {
-                        const sv = try std.fmt.allocPrint(allocator, "\"{s}\"", .{s});
-                        defer allocator.free(sv);
-                        try out_buf.appendSlice(sv);
-                        try snap.appendSlice(sv);
-                        try rec.fields.put(allocator, child_key, .{ .string = try allocator.dupe(u8, s) });
-                    },
-                    .number => |n| {
-                        var tmp: [32]u8 = undefined;
-                        const ns = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch "0";
-                        try out_buf.appendSlice(ns);
-                        try snap.appendSlice(ns);
-                        try rec.fields.put(allocator, child_key, .{ .number = n });
-                    },
-                    .boolean => |b| {
-                        const bv = if (b) "true" else "false";
-                        try out_buf.appendSlice(bv);
-                        try snap.appendSlice(bv);
-                        try rec.fields.put(allocator, child_key, .{ .boolean = b });
-                    },
-                    .null_val => {
-                        try out_buf.appendSlice("null");
-                        try snap.appendSlice("null");
-                        try rec.fields.put(allocator, child_key, .null_val);
-                    },
-                    else => allocator.free(child_key),
-                }
+            .number => |n| {
+                try appendRawScalar(raw_buf, vev);
+                try rec.fields.put(allocator, child_key, .{ .number = try Number.fromLiteral(allocator, n.value, n.text) });
             },
-            else => {},
+            .boolean => |b| {
+                try appendRawScalar(raw_buf, vev);
+                try rec.fields.put(allocator, child_key, .{ .boolean = b });
+            },
+            .null_val => {
+                try appendRawScalar(raw_buf, vev);
+                try rec.fields.put(allocator, child_key, .null_val);
+            },
+            else => return error.BadJson,
         }
     }
 }
@@ -511,61 +416,36 @@ fn collectNestedObjectDual(
 /// Consume and append a JSON array (opening `[` already consumed, `[` already appended to raw_buf).
 fn collectRawArray(sc: anytype, raw_buf: *std.array_list.Managed(u8)) !void {
     var depth: usize = 1;
-    var first = true;
+    var first = true; // no element/member written yet at the current level
     while (depth > 0) {
-        const inner = try sc.next();
-        switch (inner) {
-            .object_start => {
-                if (!first) try raw_buf.appendSlice(", ");
-                first = false;
-                try raw_buf.append('{');
-                depth += 1;
-            },
-            .object_end => {
+        const ev = try sc.next();
+        switch (ev) {
+            .object_end, .array_end => {
                 depth -= 1;
-                try raw_buf.append(if (depth > 0) '}' else '}');
-            },
-            .array_start => {
-                if (!first) try raw_buf.appendSlice(", ");
+                try raw_buf.append(if (ev == .object_end) '}' else ']');
                 first = false;
-                try raw_buf.append('[');
-                depth += 1;
-            },
-            .array_end => {
-                depth -= 1;
-                try raw_buf.append(']');
             },
             .key => |ik| {
-                try raw_buf.append('"');
-                try raw_buf.appendSlice(ik);
-                try raw_buf.appendSlice("\": ");
-                first = false;
-            },
-            .string => |s| {
                 if (!first) try raw_buf.appendSlice(", ");
-                first = false;
-                try raw_buf.append('"');
-                try raw_buf.appendSlice(s);
-                try raw_buf.append('"');
+                try appendJsonStr(raw_buf, ik);
+                try raw_buf.appendSlice(": ");
+                first = true; // the member's value follows without a separator
             },
-            .number => |n| {
+            else => {
                 if (!first) try raw_buf.appendSlice(", ");
-                first = false;
-                var tmp: [32]u8 = undefined;
-                const ns = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch "0";
-                try raw_buf.appendSlice(ns);
+                switch (ev) {
+                    .object_start, .array_start => {
+                        try raw_buf.append(if (ev == .object_start) '{' else '[');
+                        depth += 1;
+                        first = true;
+                    },
+                    .end_of_input => return error.UnexpectedEof,
+                    else => {
+                        try appendRawScalar(raw_buf, ev);
+                        first = false;
+                    },
+                }
             },
-            .boolean => |b| {
-                if (!first) try raw_buf.appendSlice(", ");
-                first = false;
-                try raw_buf.appendSlice(if (b) "true" else "false");
-            },
-            .null_val => {
-                if (!first) try raw_buf.appendSlice(", ");
-                first = false;
-                try raw_buf.appendSlice("null");
-            },
-            .end_of_input => return error.UnexpectedEof,
         }
     }
 }
@@ -663,11 +543,8 @@ pub fn execStream(
         return 0;
     }
 
-    const sel = if (q.fields) |f| @as(?[]const SelectField, f) else null;
-    const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-
-    // For limit-only (no order_by): we can stop early
-    const early_stop = q.limit != null and ob == null;
+    // Stop reading early only when every match yields exactly one output row.
+    const early_stop = canStopEarly(q);
     const lim = q.limit orelse std.math.maxInt(usize);
 
     // Collect full (unprojected) records that pass WHERE — needed so ORDER BY
@@ -684,7 +561,7 @@ pub fn execStream(
     defer scratch.deinit();
 
     // Iterate array elements
-    array_loop: while (true) {
+    array_loop: while (!(early_stop and matches.items.len >= lim)) {
         const ev = try sc.next();
         switch (ev) {
             .array_end, .end_of_input => break :array_loop,
@@ -698,45 +575,217 @@ pub fn execStream(
                 }
 
                 // Copy full record into long-lived allocator (projection happens after sort)
-                const full_rec = try copyRecordFull(allocator, &rec);
-                try matches.append(full_rec);
-
-                if (early_stop and matches.items.len >= lim) break :array_loop;
+                try matches.append(try copyRecordFull(allocator, &rec));
             },
             else => {},
         }
     }
 
-    // Sort on full records (dotted keys available)
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
+    return finalizeMatches(allocator, matches.items, q, writer, opts);
+}
+
+/// True when LIMIT may stop reading input as soon as enough records matched:
+/// no ORDER BY (needs every record), no DISTINCT (duplicates do not count),
+/// no EXPAND (one record can become several rows).
+fn canStopEarly(q: query.Query) bool {
+    return q.limit != null and q.order_by == null and !q.distinct and expandField(q.fields) == null;
+}
+
+/// The EXPAND directive of a SELECT list, if any.
+fn expandField(fields: ?[]const SelectField) ?SelectField {
+    for (fields orelse return null) |f| {
+        if (f.is_expand) return f;
+    }
+    return null;
+}
+
+/// DISTINCT bookkeeping: remembers a fingerprint of every row emitted so far.
+const DistinctSet = struct {
+    seen: std.StringHashMap(void),
+    buf: std.array_list.Managed(u8),
+
+    fn init(allocator: std.mem.Allocator) DistinctSet {
+        return .{
+            .seen = std.StringHashMap(void).init(allocator),
+            .buf = std.array_list.Managed(u8).init(allocator),
         };
-        std.sort.block(Record, matches.items, Ctx{ .ob = order }, Ctx.lessThan);
     }
 
-    // Apply limit, then project and emit
-    const count = @min(matches.items.len, lim);
+    fn deinit(self: *DistinctSet) void {
+        var it = self.seen.keyIterator();
+        while (it.next()) |k| self.seen.allocator.free(k.*);
+        self.seen.deinit();
+        self.buf.deinit();
+    }
 
-    // Project into output records
+    /// True the first time a row with these fields and values is offered.
+    fn firstSeen(self: *DistinctSet, rec: *const Record) !bool {
+        self.buf.clearRetainingCapacity();
+        var it = rec.fields.iterator();
+        while (it.next()) |e| {
+            try appendValueKey(&self.buf, .{ .string = @constCast(e.key_ptr.*) });
+            try appendValueKey(&self.buf, e.value_ptr.*);
+        }
+        if (self.seen.contains(self.buf.items)) return false;
+        const owned = try self.seen.allocator.dupe(u8, self.buf.items);
+        errdefer self.seen.allocator.free(owned);
+        try self.seen.put(owned, {});
+        return true;
+    }
+};
+
+/// Writes result rows as they are produced (no ORDER BY / EXPAND / CSV),
+/// applying DISTINCT and counting emitted rows for LIMIT.
+const RowEmitter = struct {
+    writer: *std.Io.Writer,
+    fmt: OutputFormat,
+    distinct: ?DistinctSet,
+    count: usize = 0,
+    json_first: bool = true,
+
+    fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer, fmt: OutputFormat, distinct: bool) RowEmitter {
+        return .{ .writer = writer, .fmt = fmt, .distinct = if (distinct) DistinctSet.init(allocator) else null };
+    }
+
+    fn deinit(self: *RowEmitter) void {
+        if (self.distinct) |*d| d.deinit();
+    }
+
+    /// Emit a projected row unless DISTINCT has already seen it.
+    fn emitRecord(self: *RowEmitter, rec: *Record) !void {
+        if (self.distinct) |*d| {
+            if (!try d.firstSeen(rec)) return;
+        }
+        try emitStreamingRecord(self.writer, rec, self.fmt, &self.json_first);
+        self.count += 1;
+    }
+
+    /// Emit an input line verbatim (SELECT * / bare passthrough).
+    fn emitLine(self: *RowEmitter, line: []const u8) !void {
+        switch (self.fmt) {
+            .json => {
+                try self.writer.writeAll(if (self.json_first) "[\n  " else ",\n  ");
+                self.json_first = false;
+                try self.writer.writeAll(line);
+            },
+            .ndjson, .raw => {
+                try self.writer.writeAll(line);
+                try self.writer.writeByte('\n');
+            },
+            .csv, .tsv => unreachable,
+        }
+        self.count += 1;
+    }
+
+    /// Close the JSON array wrapper (other formats need no trailer).
+    fn finish(self: *RowEmitter) !void {
+        if (self.fmt == .json) try self.writer.writeAll(if (self.count == 0) "[]\n" else "\n]\n");
+    }
+};
+
+/// Post-process buffered matches: ORDER BY → project (+EXPAND) → DISTINCT →
+/// LIMIT (on output rows) → emit. Returns the number of rows emitted.
+fn finalizeMatches(
+    allocator: std.mem.Allocator,
+    matches: []Record,
+    q: query.Query,
+    writer: *std.Io.Writer,
+    opts: ExecOptions,
+) !usize {
+    if (q.order_by) |order| sortRecords(matches, order);
+
+    const sel = if (q.fields) |f| @as(?[]const SelectField, f) else null;
+    const lim = q.limit orelse std.math.maxInt(usize);
+    const expand = expandField(sel);
+
     var out_recs = std.array_list.Managed(Record).init(allocator);
     defer {
         for (out_recs.items) |*r| r.deinit();
         out_recs.deinit();
     }
-    for (matches.items[0..count]) |*rec| {
-        const out_rec: Record = if (sel) |s|
+    var distinct: ?DistinctSet = if (q.distinct) DistinctSet.init(allocator) else null;
+    defer if (distinct) |*d| d.deinit();
+
+    // Rows produced by one match: usually one, several under EXPAND.
+    var rows = std.array_list.Managed(Record).init(allocator);
+    defer {
+        for (rows.items) |*r| r.deinit();
+        rows.deinit();
+    }
+
+    for (matches) |*rec| {
+        if (out_recs.items.len >= lim) break;
+        if (expand) |ef| {
+            try expandRecord(allocator, rec, sel, ef, &rows);
+        } else {
+            try rows.append(if (sel) |s| try projectRecord(allocator, rec, s) else try copyRecord(allocator, rec));
+        }
+        for (rows.items) |*row| {
+            const keep = out_recs.items.len < lim and
+                (if (distinct) |*d| try d.firstSeen(row) else true);
+            if (keep) {
+                try out_recs.append(row.*);
+                row.* = Record.init(allocator); // moved; leave an empty record behind
+            } else {
+                row.deinit();
+            }
+        }
+        rows.clearRetainingCapacity();
+    }
+
+    try emitResults(out_recs.items, out_recs.items.len, writer, opts.format, opts.raw);
+    return out_recs.items.len;
+}
+
+/// EXPAND: one output row per element of the array field `ef` (or of
+/// split(field, delim)), each carrying the other projected columns.
+fn expandRecord(
+    allocator: std.mem.Allocator,
+    rec: *const Record,
+    sel: ?[]const SelectField,
+    ef: SelectField,
+    rows: *std.array_list.Managed(Record),
+) !void {
+    var split_arena = std.heap.ArenaAllocator.init(allocator);
+    defer split_arena.deinit();
+    const field_ov = rec.get(ef.key) orelse return;
+    const field_str: []const u8 = switch (field_ov) {
+        .string => |sv| sv,
+        .raw => |r| r,
+        else => return,
+    };
+    // For expand(split(field, delim)), build the JSON array by splitting.
+    const arr_json: []const u8 = if (ef.expand_split_delim) |delim| blk: {
+        var arr_buf = std.array_list.Managed(u8).init(split_arena.allocator());
+        try arr_buf.append('[');
+        var it_sp = std.mem.splitSequence(u8, field_str, delim);
+        var first_elem = true;
+        while (it_sp.next()) |tok_str| {
+            if (!first_elem) try arr_buf.append(',');
+            first_elem = false;
+            try appendJsonStr(&arr_buf, tok_str);
+        }
+        try arr_buf.append(']');
+        break :blk arr_buf.items;
+    } else field_str;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, arr_json, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    for (parsed.value.array.items) |elem| {
+        // Project non-expand fields from the current record, then add the element
+        var out_rec: Record = if (sel) |s|
             try projectRecord(allocator, rec, s)
         else
             try copyRecord(allocator, rec);
-        try out_recs.append(out_rec);
+        errdefer out_rec.deinit();
+        const exp_key = try allocator.dupe(u8, if (ef.alias) |a| a else ef.key);
+        errdefer allocator.free(exp_key);
+        var exp_val = try ownedFromJson(allocator, elem);
+        errdefer exp_val.deinit(allocator);
+        try out_rec.fields.put(allocator, exp_key, exp_val);
+        try rows.append(out_rec);
     }
-
-    try emitResults(out_recs.items, count, writer, opts.format, opts.raw);
-    return count;
 }
 
 // ─── NDJSON streaming executor ───────────────────────────────────────────────
@@ -757,33 +806,25 @@ pub fn execStreamNDJSON(
     opts: ExecOptions,
 ) !usize {
     const sel = if (q.fields) |f| @as(?[]const SelectField, f) else null;
-    const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
     const fmt = if (opts.raw) OutputFormat.raw else opts.format;
-
-    const early_stop = q.limit != null and ob == null;
     const lim = q.limit orelse std.math.maxInt(usize);
 
-    // Streaming emit: when there is no ORDER BY, no DISTINCT, no EXPAND, and the
-    // output format doesn't require buffering (not CSV/TSV), emit each matching
-    // record immediately from the scratch arena.  This eliminates copyRecordFull
-    // and the matches[] heap vec entirely — O(1) memory for the common case.
-    const has_expand = if (sel) |s| blk: {
-        for (s) |f| {
-            if (f.is_expand) break :blk true;
-        }
-        break :blk false;
-    } else false;
-    const streaming_emit = ob == null and !q.distinct and !has_expand and
+    // Streaming emit: unless something needs the whole match set first —
+    // ORDER BY, EXPAND, or CSV/TSV (the header comes from the first row) —
+    // emit each row as it arrives, straight from the scratch arena: O(1)
+    // memory (O(distinct rows) under DISTINCT), and LIMIT stops reading.
+    const streaming_emit = q.order_by == null and expandField(sel) == null and
         fmt != .csv and fmt != .tsv;
-    var emit_count: usize = 0;
-    var json_first = true; // for streaming JSON array formatting
+    var emitter = RowEmitter.init(allocator, writer, fmt, q.distinct);
+    defer emitter.deinit();
 
-    // Buffered path only: collect full records for ORDER BY / DISTINCT / EXPAND / CSV
+    // Buffered path only: collect full records for ORDER BY / EXPAND / CSV
     var matches = std.array_list.Managed(Record).init(allocator);
     defer {
         for (matches.items) |*r| r.deinit();
         matches.deinit();
     }
+    const buffered_early_stop = canStopEarly(q);
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
@@ -794,7 +835,11 @@ pub fn execStreamNDJSON(
     var line_buf = std.array_list.Managed(u8).init(allocator);
     defer line_buf.deinit();
 
-    ndjson_loop: while (true) {
+    ndjson_loop: while (if (streaming_emit) emitter.count < lim else !(buffered_early_stop and matches.items.len >= lim)) {
+        // About to wait for more input: push out what was emitted so far, so a
+        // slow stream (`tail -f | kqq`) sees rows promptly while bulk input is
+        // written in large batches rather than one syscall per row.
+        if (streaming_emit and reader.bufferedLen() == 0) try writer.flush();
         // Fast path: takeDelimiter returns a zero-copy slice if the line fits in the
         // reader buffer. For lines > 64 KB it returns StreamTooLong (consuming
         // exactly one buffer-worth of bytes); the slow path then keeps calling
@@ -830,347 +875,101 @@ pub fn execStreamNDJSON(
 
         const trimmed = std.mem.trimEnd(u8, raw_line, " \t\r");
         if (trimmed.len == 0) continue :ndjson_loop;
-        // Skip lines that don't start an object (arrays, bare values, comments)
-        if (trimmed[0] != '{') {
-            if (opts.tee_writer) |tw| {
-                try tw.writeAll(trimmed);
-                try tw.writeByte('\n');
-            }
-            continue :ndjson_loop;
-        }
 
-        // --tee: write every record (match or not) to the tee file
+        // --tee: write every line (match or not, record or not) to the tee file
         if (opts.tee_writer) |tw| {
             try tw.writeAll(trimmed);
             try tw.writeByte('\n');
         }
 
+        // Skip lines that don't start an object (arrays, bare values, comments)
+        if (trimmed[0] != '{') continue :ndjson_loop;
+
+        // A JSON array written one element per line leaves a trailing comma.
+        const line = if (trimmed[trimmed.len - 1] == ',')
+            std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - 1], " \t")
+        else
+            trimmed;
+
         // ── Raw-byte fast path ────────────────────────────────────────────────
         // Attempt WHERE evaluation directly on raw bytes before any parsing.
-        // If the WHERE is satisfied AND we only need SELECT * (no projection,
-        // no ORDER BY, no DISTINCT) in streaming-emit mode, emit the raw line
-        // directly — zero allocations, zero parse overhead per record.
+        // Lines emitted (or rejected) verbatim are validated first, so a
+        // malformed line is skipped exactly as the parsing path would skip it.
+        var where_passed = false;
         if (q.where) |w| {
-            if (tryWhereOnRaw(trimmed, w)) |passes| {
+            if (tryWhereOnRaw(line, w)) |passes| {
                 if (!passes) {
                     if (opts.reject_writer) |rw| {
-                        try rw.writeAll(trimmed);
-                        try rw.writeByte('\n');
+                        if (stream.isValidJson(line)) {
+                            try rw.writeAll(line);
+                            try rw.writeByte('\n');
+                        } else if (opts.skipped_records) |sk| sk.* += 1;
                     }
                     continue :ndjson_loop;
                 }
-                // WHERE passed on raw bytes — if SELECT * and streaming emit,
-                // emit the raw line directly without any parsing.
+                // WHERE passed on raw bytes — for SELECT * in streaming mode,
+                // emit the line directly without building a record.
                 if (streaming_emit and sel == null) {
-                    switch (fmt) {
-                        .json => {
-                            if (json_first) {
-                                try writer.writeAll("[\n  ");
-                                json_first = false;
-                            } else try writer.writeAll(",\n  ");
-                            try writer.writeAll(trimmed);
-                        },
-                        .ndjson, .raw => {
-                            try writer.writeAll(trimmed);
-                            try writer.writeByte('\n');
-                            try writer.flush();
-                        },
-                        .csv, .tsv => unreachable,
-                    }
-                    emit_count += 1;
-                    if (early_stop and emit_count >= lim) break :ndjson_loop;
+                    if (stream.isValidJson(line)) {
+                        try emitter.emitLine(line);
+                    } else if (opts.skipped_records) |sk| sk.* += 1;
                     continue :ndjson_loop;
                 }
-                // WHERE passed but we still need projection/ordering — fall through
-                // to full parse, but skip the WHERE re-check below.
-                _ = scratch.reset(.retain_capacity);
-                var line_reader_fp = std.Io.Reader.fixed(trimmed);
-                var sub_sc_fp = stream.Scanner.init(scratch.allocator(), &line_reader_fp) catch {
-                    if (opts.skipped_records) |sk| sk.* += 1;
-                    continue :ndjson_loop;
-                };
-                const first_ev_fp = sub_sc_fp.next() catch {
-                    if (opts.skipped_records) |sk| sk.* += 1;
-                    continue :ndjson_loop;
-                };
-                if (first_ev_fp != .object_start) {
-                    if (opts.skipped_records) |sk| sk.* += 1;
-                    continue :ndjson_loop;
-                }
-                var rec_fp = collectRecord(scratch.allocator(), &sub_sc_fp) catch {
-                    if (opts.skipped_records) |sk| sk.* += 1;
-                    continue :ndjson_loop;
-                };
-                // Skip to emit — WHERE already confirmed above
-                if (streaming_emit) {
-                    var out_rec_fp = try projectRecord(scratch.allocator(), &rec_fp, sel.?);
-                    try emitStreamingRecord(writer, &out_rec_fp, fmt, &json_first);
-                    emit_count += 1;
-                    if (early_stop and emit_count >= lim) break :ndjson_loop;
-                } else {
-                    const full_rec_fp = try copyRecordFull(allocator, &rec_fp);
-                    try matches.append(full_rec_fp);
-                    if (early_stop and matches.items.len >= lim) break :ndjson_loop;
-                }
-                continue :ndjson_loop;
+                where_passed = true; // still need projection / buffering
             }
             // null → raw evaluation inconclusive, fall through to full parse
         }
 
         _ = scratch.reset(.retain_capacity);
-        var line_reader = std.Io.Reader.fixed(trimmed);
-        var sub_sc = stream.Scanner.init(scratch.allocator(), &line_reader) catch {
-            if (opts.skipped_records) |sk| sk.* += 1;
-            continue :ndjson_loop;
-        };
-        // consume the opening `{` (object_start event)
-        const first_ev = sub_sc.next() catch {
-            if (opts.skipped_records) |sk| sk.* += 1;
-            continue :ndjson_loop;
-        };
-        if (first_ev != .object_start) {
-            if (opts.skipped_records) |sk| sk.* += 1;
-            continue :ndjson_loop;
-        }
-
-        var rec = collectRecord(scratch.allocator(), &sub_sc) catch {
+        var rec = parseLineRecord(scratch.allocator(), line) catch |err| {
+            if (!stream.isSyntaxError(err)) return err;
             if (opts.skipped_records) |sk| sk.* += 1;
             continue :ndjson_loop;
         };
 
         if (q.where) |w| {
-            if (!recordPassesWhere(scratch.allocator(), &rec, w)) {
+            if (!where_passed and !recordPassesWhere(scratch.allocator(), &rec, w)) {
                 // --reject: write non-matching records to the reject file
                 if (opts.reject_writer) |rw| {
-                    try rw.writeAll(trimmed);
+                    try rw.writeAll(line);
                     try rw.writeByte('\n');
                 }
                 continue :ndjson_loop;
             }
         }
 
-        // ── Streaming emit path ───────────────────────────────────────────────
-        // Emit immediately from scratch arena — no heap allocation, no copyRecordFull.
         if (streaming_emit) {
             if (sel) |fields| {
                 // Project into scratch arena (all allocs freed on next scratch.reset())
                 var out_rec = try projectRecord(scratch.allocator(), &rec, fields);
-                switch (fmt) {
-                    .json => {
-                        if (json_first) {
-                            try writer.writeAll("[\n  ");
-                            json_first = false;
-                        } else try writer.writeAll(",\n  ");
-                        try writeRecordJson(writer, &out_rec);
-                    },
-                    .ndjson => {
-                        try writeRecordJson(writer, &out_rec);
-                        try writer.writeByte('\n');
-                        try writer.flush();
-                    },
-                    .raw => {
-                        var it = out_rec.fields.iterator();
-                        if (it.next()) |e| try writeOwnedValueRaw(writer, e.value_ptr.*);
-                        try writer.writeByte('\n');
-                        try writer.flush();
-                    },
-                    .csv, .tsv => unreachable,
-                }
+                try emitter.emitRecord(&out_rec);
             } else {
-                // No field list (SELECT * or bare passthrough): emit the raw trimmed line
-                switch (fmt) {
-                    .json => {
-                        if (json_first) {
-                            try writer.writeAll("[\n  ");
-                            json_first = false;
-                        } else try writer.writeAll(",\n  ");
-                        try writer.writeAll(trimmed);
-                    },
-                    .ndjson, .raw => {
-                        try writer.writeAll(trimmed);
-                        try writer.writeByte('\n');
-                        try writer.flush();
-                    },
-                    .csv, .tsv => unreachable,
-                }
+                // No field list (bare passthrough / WHERE only): emit the line itself
+                try emitter.emitLine(line);
             }
-            emit_count += 1;
-            if (early_stop and emit_count >= lim) break :ndjson_loop;
             continue :ndjson_loop;
         }
 
-        // ── Buffered path (ORDER BY / DISTINCT / EXPAND / CSV) ───────────────
-        const full_rec = try copyRecordFull(allocator, &rec);
-        try matches.append(full_rec);
-
-        if (early_stop and matches.items.len >= lim) break :ndjson_loop;
+        // ── Buffered path (ORDER BY / EXPAND / CSV) ──────────────────────────
+        try matches.append(try copyRecordFull(allocator, &rec));
     }
 
-    // Close streaming JSON array and return
     if (streaming_emit) {
-        switch (fmt) {
-            .json => if (emit_count == 0)
-                try writer.writeAll("[]\n")
-            else
-                try writer.writeAll("\n]\n"),
-            .ndjson, .raw => {},
-            .csv, .tsv => unreachable,
-        }
-        return emit_count;
+        try emitter.finish();
+        return emitter.count;
     }
+    return finalizeMatches(allocator, matches.items, q, writer, opts);
+}
 
-    // Sort on full records (dotted keys available for ORDER BY)
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, matches.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
-
-    const count = @min(matches.items.len, lim);
-
-    // Find any EXPAND field in the select list
-    const expand_field: ?SelectField = if (sel) |s| blk: {
-        for (s) |f| {
-            if (f.is_expand) break :blk f;
-        }
-        break :blk null;
-    } else null;
-
-    // Project into output records
-    var out_recs = std.array_list.Managed(Record).init(allocator);
-    defer {
-        for (out_recs.items) |*r| r.deinit();
-        out_recs.deinit();
-    }
-
-    // DISTINCT dedup set: keyed by serialised field values
-    var distinct_set = std.StringHashMap(void).init(allocator);
-    defer {
-        var it_ds = distinct_set.keyIterator();
-        while (it_ds.next()) |k| allocator.free(k.*);
-        distinct_set.deinit();
-    }
-
-    for (matches.items[0..count]) |*rec| {
-        // EXPAND: expand an array field into multiple output rows
-        if (expand_field) |ef| {
-            // Determine the JSON array to expand.
-            // For expand(split(field, delim)), apply split first.
-            var split_arena: ?std.heap.ArenaAllocator = null;
-            defer if (split_arena) |*a| a.deinit();
-            const arr_json: []const u8 = if (ef.expand_split_delim) |delim| blk: {
-                const field_ov = rec.get(ef.key) orelse continue;
-                const field_str: []const u8 = switch (field_ov) {
-                    .string => |s| s,
-                    .raw => |r| r,
-                    else => continue,
-                };
-                // Build a JSON array by splitting field_str on delim
-                split_arena = std.heap.ArenaAllocator.init(allocator);
-                const sa = split_arena.?.allocator();
-                var arr_buf = std.array_list.Managed(u8).init(sa);
-                try arr_buf.append('[');
-                var first_elem = true;
-                var it_sp = std.mem.splitSequence(u8, field_str, delim);
-                while (it_sp.next()) |tok_str| {
-                    if (!first_elem) try arr_buf.append(',');
-                    first_elem = false;
-                    try arr_buf.append('"');
-                    for (tok_str) |c| {
-                        if (c == '"') try arr_buf.appendSlice("\\\"") else if (c == '\\') try arr_buf.appendSlice("\\\\") else try arr_buf.append(c);
-                    }
-                    try arr_buf.append('"');
-                }
-                try arr_buf.append(']');
-                break :blk arr_buf.items;
-            } else blk: {
-                const arr_ov = rec.get(ef.key) orelse continue;
-                // The array is stored as a .raw JSON string — parse and iterate
-                break :blk switch (arr_ov) {
-                    .raw => |r| r,
-                    .string => |s| s,
-                    else => continue,
-                };
-            };
-            // Parse the JSON array
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, arr_json, .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value != .array) continue;
-            for (parsed.value.array.items) |elem| {
-                // Project non-expand fields from the current record, then add the element
-                var out_rec: Record = if (sel) |s|
-                    try projectRecord(allocator, rec, s)
-                else
-                    try copyRecord(allocator, rec);
-                errdefer out_rec.deinit();
-                const exp_key = try allocator.dupe(u8, if (ef.alias) |a| a else ef.key);
-                errdefer allocator.free(exp_key);
-                const exp_val: OwnedValue = switch (elem) {
-                    .string => |s| .{ .string = try allocator.dupe(u8, s) },
-                    .integer => |n| .{ .number = @floatFromInt(n) },
-                    .float => |f2| .{ .number = f2 },
-                    .bool => |b| .{ .boolean = b },
-                    .null => .null_val,
-                    else => v: {
-                        var aw = std.Io.Writer.Allocating.init(allocator);
-                        errdefer aw.deinit();
-                        try std.json.Stringify.value(elem, .{}, &aw.writer);
-                        break :v OwnedValue{ .raw = try aw.toOwnedSlice() };
-                    },
-                };
-                try out_rec.fields.put(allocator, exp_key, exp_val);
-                try out_recs.append(out_rec);
-            }
-            continue;
-        }
-
-        // Normal projection
-        var out_rec: Record = if (sel) |s|
-            try projectRecord(allocator, rec, s)
-        else
-            try copyRecord(allocator, rec);
-        errdefer out_rec.deinit();
-
-        // DISTINCT: compute a fingerprint of all field values and skip duplicates
-        if (q.distinct) {
-            var fp_buf = std.array_list.Managed(u8).init(allocator);
-            defer fp_buf.deinit();
-            var it2 = out_rec.fields.iterator();
-            while (it2.next()) |e| {
-                try fp_buf.appendSlice(e.key_ptr.*);
-                try fp_buf.append('=');
-                switch (e.value_ptr.*) {
-                    .string => |s| try fp_buf.appendSlice(s),
-                    .number => |n| {
-                        var tb: [32]u8 = undefined;
-                        const ns = std.fmt.bufPrint(&tb, "{d}", .{n}) catch "";
-                        try fp_buf.appendSlice(ns);
-                    },
-                    .boolean => |b| try fp_buf.appendSlice(if (b) "true" else "false"),
-                    .null_val => try fp_buf.appendSlice("null"),
-                    .raw => |r| try fp_buf.appendSlice(r),
-                }
-                try fp_buf.append(';');
-            }
-            const fp = fp_buf.items;
-            if (distinct_set.contains(fp)) {
-                out_rec.deinit();
-                continue;
-            }
-            const fp_owned = try allocator.dupe(u8, fp);
-            try distinct_set.put(fp_owned, {});
-        }
-
-        try out_recs.append(out_rec);
-    }
-
-    const out_count = out_recs.items.len;
-    try emitResults(out_recs.items, out_count, writer, opts.format, opts.raw);
-    return out_count;
+/// Parse one NDJSON line holding exactly one object (anything after the
+/// closing brace is a syntax error).
+fn parseLineRecord(allocator: std.mem.Allocator, line: []const u8) !Record {
+    var line_reader = std.Io.Reader.fixed(line);
+    var sc = try stream.Scanner.init(allocator, &line_reader);
+    if (try sc.next() != .object_start) return error.BadJson;
+    const rec = try collectRecord(allocator, &sc);
+    if (try sc.next() != .end_of_input) return error.BadJson;
+    return rec;
 }
 
 // ─── Group-by + count executor ───────────────────────────────────────────────
@@ -1184,57 +983,235 @@ pub fn execStreamNDJSON(
 // counting occurrences. Then projects the group key + count into result Records,
 // sorts, limits, and emits.
 
-/// Internal group-by aggregation over an already-collected slice of Records.
-/// Returns a new slice of Records (one per group), owned by `allocator`.
+// ─── Aggregate accumulators ──────────────────────────────────────────────────
+
+/// The value an aggregate SELECT field reads from a record: its expression
+/// when one was written (`sum(price * qty)`), otherwise the named field.
+fn aggInput(scratch: std.mem.Allocator, rec: *const Record, f: SelectField) ?OwnedValue {
+    if (f.expr) |e| return evalExpr(scratch, rec, e);
+    return rec.get(f.key);
+}
+
+/// Running state for the aggregate fields of a SELECT list (sum, avg, min,
+/// max, stddev, variance, count(x)) — one slot per aggregate, in SELECT order.
+/// stddev/variance use Welford's online algorithm (means + m2s).
+const AggAccum = struct {
+    sums: []f64,
+    mins: []f64,
+    maxs: []f64,
+    means: []f64,
+    m2s: []f64,
+    n_num: []usize, // numeric inputs seen, per slot
+    n_nonnull: []usize, // non-null inputs seen, per slot (count(x))
+
+    fn init(allocator: std.mem.Allocator, n: usize) !AggAccum {
+        const floats = try allocator.alloc(f64, 5 * n);
+        errdefer allocator.free(floats);
+        const counts = try allocator.alloc(usize, 2 * n);
+        @memset(floats[0 .. 2 * n], 0.0); // sums, means (below)
+        const acc = AggAccum{
+            .sums = floats[0..n],
+            .means = floats[n .. 2 * n],
+            .m2s = floats[2 * n .. 3 * n],
+            .mins = floats[3 * n .. 4 * n],
+            .maxs = floats[4 * n .. 5 * n],
+            .n_num = counts[0..n],
+            .n_nonnull = counts[n .. 2 * n],
+        };
+        @memset(acc.m2s, 0.0);
+        @memset(acc.mins, std.math.floatMax(f64));
+        @memset(acc.maxs, -std.math.floatMax(f64));
+        @memset(counts, 0);
+        return acc;
+    }
+
+    fn deinit(self: AggAccum, allocator: std.mem.Allocator) void {
+        allocator.free(self.sums.ptr[0 .. 5 * self.sums.len]);
+        allocator.free(self.n_num.ptr[0 .. 2 * self.n_num.len]);
+    }
+
+    /// Fold one input value into slot `i`. Null and missing values are ignored
+    /// (SQL semantics); non-numeric values only count towards count(x).
+    fn add(self: AggAccum, i: usize, v: ?OwnedValue) void {
+        const val = v orelse return;
+        if (val == .null_val) return;
+        self.n_nonnull[i] += 1;
+        const n = toF64(val) orelse return;
+        self.sums[i] += n;
+        if (n < self.mins[i]) self.mins[i] = n;
+        if (n > self.maxs[i]) self.maxs[i] = n;
+        self.n_num[i] += 1;
+        const cnt: f64 = @floatFromInt(self.n_num[i]);
+        const delta = n - self.means[i];
+        self.means[i] += delta / cnt;
+        self.m2s[i] += delta * (n - self.means[i]);
+    }
+
+    /// Feed one record to every aggregate field of `fields`.
+    fn addRecord(self: AggAccum, scratch: std.mem.Allocator, rec: *const Record, fields: []const SelectField) void {
+        var i: usize = 0;
+        for (fields) |f| {
+            const agg = f.agg orelse continue;
+            if (agg == .count_rows) {
+                self.n_nonnull[i] += 1;
+            } else {
+                self.add(i, aggInput(scratch, rec, f));
+            }
+            i += 1;
+        }
+    }
+
+    fn result(self: AggAccum, i: usize, agg: AggFunc) OwnedValue {
+        if (agg == .count or agg == .count_rows) return OwnedValue.num(@floatFromInt(self.n_nonnull[i]));
+        const cnt = self.n_num[i];
+        if (cnt == 0) return .null_val;
+        const n: f64 = @floatFromInt(cnt);
+        return OwnedValue.num(switch (agg) {
+            .sum => self.sums[i],
+            .avg => self.sums[i] / n,
+            .min => self.mins[i],
+            .max => self.maxs[i],
+            .variance => self.m2s[i] / n,
+            .stddev => @sqrt(self.m2s[i] / n),
+            .count, .count_rows => unreachable,
+        });
+    }
+
+    /// Append every aggregate column to `rec`, in SELECT order.
+    fn appendResults(
+        self: AggAccum,
+        allocator: std.mem.Allocator,
+        rec: *Record,
+        fields: ?[]const SelectField,
+    ) !void {
+        const flds = fields orelse return;
+        var i: usize = 0;
+        for (flds) |f| {
+            const agg = f.agg orelse continue;
+            const name = try allocator.dupe(u8, if (f.alias) |a| a else f.key);
+            errdefer allocator.free(name);
+            try rec.fields.put(allocator, name, self.result(i, agg));
+            i += 1;
+        }
+    }
+};
+
+fn countAggFields(fields: ?[]const SelectField) usize {
+    var n: usize = 0;
+    if (fields) |flds| for (flds) |f| {
+        if (f.agg != null) n += 1;
+    };
+    return n;
+}
+
+/// Global (no GROUP BY) aggregation: `select count(), avg(x) where ...`.
+const GlobalAgg = struct {
+    accum: AggAccum,
+    q: *const query.Query,
+
+    fn init(allocator: std.mem.Allocator, q: *const query.Query) !GlobalAgg {
+        return .{ .accum = try AggAccum.init(allocator, countAggFields(q.fields)), .q = q };
+    }
+
+    fn deinit(self: *GlobalAgg, allocator: std.mem.Allocator) void {
+        self.accum.deinit(allocator);
+    }
+
+    /// Apply WHERE and fold the record in. Returns whether it was counted.
+    fn add(self: *GlobalAgg, scratch: std.mem.Allocator, rec: *const Record) bool {
+        if (self.q.where) |w| {
+            if (!recordPassesWhere(scratch, rec, w)) return false;
+        }
+        if (self.q.fields) |f| self.accum.addRecord(scratch, rec, f);
+        return true;
+    }
+
+    fn toRecord(self: *const GlobalAgg, allocator: std.mem.Allocator) !Record {
+        var rec = Record.init(allocator);
+        errdefer rec.deinit();
+        try self.accum.appendResults(allocator, &rec, self.q.fields);
+        return rec;
+    }
+
+    /// --rolling: one NDJSON line with the aggregates so far.
+    fn emitSnapshot(self: *const GlobalAgg, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+        var rec = try self.toRecord(allocator);
+        defer rec.deinit();
+        try writeRecordJson(writer, &rec);
+        try writer.writeByte('\n');
+        try writer.flush();
+    }
+
+    fn emit(self: *const GlobalAgg, allocator: std.mem.Allocator, writer: *std.Io.Writer, opts: ExecOptions) !usize {
+        var rec = try self.toRecord(allocator);
+        defer rec.deinit();
+        var one = [1]Record{rec};
+        try emitResults(&one, 1, writer, opts.format, opts.raw);
+        return 1;
+    }
+};
+
+/// Append a type-tagged, length-prefixed encoding of `v` to `buf`, so that
+/// distinct values never collide (1 vs "1", or strings containing separators).
+/// Used for GROUP BY keys and DISTINCT fingerprints.
+fn appendValueKey(buf: *std.array_list.Managed(u8), v: OwnedValue) !void {
+    var tmp: [64]u8 = undefined;
+    const tag: u8, const bytes: []const u8 = switch (v) {
+        .string => |sv| .{ 's', sv },
+        // -0 and 0 are the same value
+        .number => |n| .{ 'n', if (n.lit == null and n.f == 0) "0" else n.text(&tmp) },
+        .boolean => |b| .{ 'b', if (b) "1" else "0" },
+        .null_val => .{ 'z', "" },
+        .raw => |r| .{ 'r', r },
+    };
+    try buf.append(tag);
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(bytes.len), .little);
+    try buf.appendSlice(&len);
+    try buf.appendSlice(bytes);
+}
+
+/// Internal group-by aggregation over records produced by `records_iter`.
+/// Returns a new list of Records (one per group), owned by `allocator`.
 fn aggregateGroupBy(
     allocator: std.mem.Allocator,
     records_iter: anytype, // must support: while(try iter.next()) |rec| { ... }
     group_keys: []const query.GroupByKey,
-    count_alias: []const u8, // the output field name for the count
-    extra_fields: ?[]const SelectField, // non-count SELECT fields (typically just the group key)
+    extra_fields: ?[]const SelectField, // the SELECT list (aggregates are read from it)
     where: ?query.WhereClause,
 ) !std.array_list.Managed(Record) {
     const n_group_keys = group_keys.len;
+    if (n_group_keys > 16) return error.TooManyGroupKeys;
     // Per-group state
     const AggState = struct {
-        count: usize,
         group_vals: []OwnedValue, // one per group key, heap-owned slice
-        // For each aggregate field (sum/avg/min/max/stddev/variance): running accumulators.
-        // We store parallel slices indexed by position in extra_fields agg list.
-        // stddev/variance use Welford's online algorithm (means + m2s).
-        sums: []f64,
-        mins: []f64,
-        maxs: []f64,
-        means: []f64, // Welford running mean
-        m2s: []f64, // Welford sum of squared deviations
-        n_numeric: []usize, // count of numeric contributions per agg field
-        allocator: std.mem.Allocator,
-        n_aggs: usize,
+        accum: AggAccum,
+    };
 
-        fn deinit(self: *@This()) void {
-            for (self.group_vals) |*gv| gv.deinit(self.allocator);
-            self.allocator.free(self.group_vals);
-            self.allocator.free(self.sums);
-            self.allocator.free(self.mins);
-            self.allocator.free(self.maxs);
-            self.allocator.free(self.means);
-            self.allocator.free(self.m2s);
-            self.allocator.free(self.n_numeric);
+    const n_aggs = countAggFields(extra_fields);
+
+    // isnull(key, default) in SELECT supplies a value for records whose group
+    // key is missing or null. Resolved once per key (by output name).
+    var isnull_defaults: [16]?[]const u8 = @splat(null);
+    for (group_keys, 0..) |gk, gi| {
+        for (extra_fields orelse break) |f| {
+            const matches = std.mem.eql(u8, f.key, gk.key) or
+                (f.alias != null and std.mem.eql(u8, f.alias.?, gk.key));
+            if (matches and f.default_val != null) {
+                isnull_defaults[gi] = f.default_val;
+                break;
+            }
         }
-    };
-
-    // Count how many agg fields there are
-    var n_aggs: usize = 0;
-    if (extra_fields) |ef| for (ef) |f| {
-        if (f.agg != null) n_aggs += 1;
-    };
+    }
 
     var states = std.StringHashMap(AggState).init(allocator);
     defer {
         var sit = states.iterator();
         while (sit.next()) |e| {
             allocator.free(e.key_ptr.*);
-            e.value_ptr.deinit();
+            for (e.value_ptr.group_vals) |*gv| gv.deinit(allocator);
+            allocator.free(e.value_ptr.group_vals);
+            e.value_ptr.accum.deinit(allocator);
         }
         states.deinit();
     }
@@ -1251,30 +1228,19 @@ fn aggregateGroupBy(
             if (!recordPassesWhere(scratch.allocator(), &r, w)) continue;
         }
 
-        // Build composite group key from all group-by fields, joined by \x00.
+        // Build a composite group key from all group-by values.
         // If any key field is missing (and no isnull default), skip the record.
         var composite_buf = std.array_list.Managed(u8).init(scratch.allocator());
         var gv_list: [16]OwnedValue = undefined; // stack buffer, supports up to 16 group keys
-        var gv_count: usize = 0;
         var skip_record = false;
 
-        for (group_keys) |gk| {
-            if (gv_count >= gv_list.len) break;
+        for (group_keys, 0..) |gk, gi| {
             // Evaluate: if the group key has an expression, eval it; otherwise field lookup.
             const gv_raw: ?OwnedValue = if (gk.expr) |expr|
                 evalExpr(scratch.allocator(), &r, expr)
             else
                 r.get(gk.key);
-            // isnull default lookup (by output key name)
-            const isnull_default: ?[]const u8 = if (extra_fields) |ef| blk: {
-                for (ef) |f| {
-                    const fk = f.key;
-                    const matches = std.mem.eql(u8, fk, gk.key) or
-                        (f.alias != null and std.mem.eql(u8, f.alias.?, gk.key));
-                    if (matches and f.default_val != null) break :blk f.default_val;
-                }
-                break :blk null;
-            } else null;
+            const isnull_default = isnull_defaults[gi];
 
             const gv: OwnedValue = if (gv_raw) |v| blk: {
                 if (v == .null_val) {
@@ -1283,86 +1249,34 @@ fn aggregateGroupBy(
                 break :blk v;
             } else if (isnull_default) |def|
                 OwnedValue{ .string = @constCast(def) }
-            else blk: {
+            else {
                 skip_record = true;
-                break :blk OwnedValue.null_val;
+                break;
             };
 
-            if (skip_record) break;
-
-            // Append this key's string representation to the composite key
-            if (gv_count > 0) try composite_buf.append(0); // null byte separator
-            var part_buf: [256]u8 = undefined;
-            const part: []const u8 = switch (gv) {
-                .string => |s| s,
-                .number => |n| std.fmt.bufPrint(&part_buf, "{d}", .{n}) catch continue,
-                .boolean => |b| if (b) "true" else "false",
-                .null_val => "null",
-                .raw => |rv| rv,
-            };
-            try composite_buf.appendSlice(part);
-            gv_list[gv_count] = gv;
-            gv_count += 1;
+            try appendValueKey(&composite_buf, gv);
+            gv_list[gi] = gv;
         }
 
-        if (skip_record or gv_count != n_group_keys) continue;
+        if (skip_record) continue;
 
         const key_str = composite_buf.items;
         const gop = try states.getOrPut(key_str);
         if (!gop.found_existing) {
-            gop.key_ptr.* = try allocator.dupe(u8, key_str);
+            errdefer _ = states.remove(key_str);
+            const owned_key = try allocator.dupe(u8, key_str);
+            errdefer allocator.free(owned_key);
             // Own copies of each group value
             const owned_gvs = try allocator.alloc(OwnedValue, n_group_keys);
-            for (gv_list[0..gv_count], 0..) |gv, gi| {
+            errdefer allocator.free(owned_gvs);
+            for (gv_list[0..n_group_keys], 0..) |gv, gi| {
                 owned_gvs[gi] = try gv.copy(allocator);
             }
-            const sums = try allocator.alloc(f64, n_aggs);
-            @memset(sums, 0.0);
-            const mins = try allocator.alloc(f64, n_aggs);
-            @memset(mins, std.math.floatMax(f64));
-            const maxs = try allocator.alloc(f64, n_aggs);
-            @memset(maxs, -std.math.floatMax(f64));
-            const means = try allocator.alloc(f64, n_aggs);
-            @memset(means, 0.0);
-            const m2s = try allocator.alloc(f64, n_aggs);
-            @memset(m2s, 0.0);
-            const n_numeric = try allocator.alloc(usize, n_aggs);
-            @memset(n_numeric, 0);
-            gop.value_ptr.* = AggState{
-                .count = 0,
-                .group_vals = owned_gvs,
-                .sums = sums,
-                .mins = mins,
-                .maxs = maxs,
-                .means = means,
-                .m2s = m2s,
-                .n_numeric = n_numeric,
-                .allocator = allocator,
-                .n_aggs = n_aggs,
-            };
+            const accum = try AggAccum.init(allocator, n_aggs);
+            gop.key_ptr.* = owned_key;
+            gop.value_ptr.* = .{ .group_vals = owned_gvs, .accum = accum };
         }
-        gop.value_ptr.count += 1;
-
-        // Accumulate aggregate fields
-        if (extra_fields) |ef| {
-            var agg_idx: usize = 0;
-            for (ef) |f| {
-                if (f.agg == null) continue;
-                defer agg_idx += 1;
-                const fv = r.get(f.key) orelse continue;
-                const n = toF64(fv) orelse continue;
-                gop.value_ptr.sums[agg_idx] += n;
-                if (n < gop.value_ptr.mins[agg_idx]) gop.value_ptr.mins[agg_idx] = n;
-                if (n > gop.value_ptr.maxs[agg_idx]) gop.value_ptr.maxs[agg_idx] = n;
-                gop.value_ptr.n_numeric[agg_idx] += 1;
-                // Welford online update for variance/stddev
-                const cnt_f: f64 = @floatFromInt(gop.value_ptr.n_numeric[agg_idx]);
-                const delta = n - gop.value_ptr.means[agg_idx];
-                gop.value_ptr.means[agg_idx] += delta / cnt_f;
-                const delta2 = n - gop.value_ptr.means[agg_idx];
-                gop.value_ptr.m2s[agg_idx] += delta * delta2;
-            }
-        }
+        if (extra_fields) |ef| gop.value_ptr.accum.addRecord(scratch.allocator(), &r, ef);
     }
 
     // Build result Records
@@ -1386,32 +1300,8 @@ fn aggregateGroupBy(
             try rec.fields.put(allocator, gk_name, gv_copy);
         }
 
-        // Add count field (only if count() was in the SELECT)
-        if (count_alias.len > 0) {
-            const cnt_name = try allocator.dupe(u8, count_alias);
-            errdefer allocator.free(cnt_name);
-            try rec.fields.put(allocator, cnt_name, .{ .number = @floatFromInt(state.count) });
-        }
-
-        // Add aggregate fields
-        if (extra_fields) |ef| {
-            var agg_idx: usize = 0;
-            for (ef) |f| {
-                if (f.agg == null) continue;
-                defer agg_idx += 1;
-                const out_name = try allocator.dupe(u8, if (f.alias) |a| a else f.key);
-                const n_seen = state.n_numeric[agg_idx];
-                const agg_val: OwnedValue = if (n_seen == 0) .null_val else switch (f.agg.?) {
-                    .sum => .{ .number = state.sums[agg_idx] },
-                    .avg => .{ .number = state.sums[agg_idx] / @as(f64, @floatFromInt(n_seen)) },
-                    .min => .{ .number = state.mins[agg_idx] },
-                    .max => .{ .number = state.maxs[agg_idx] },
-                    .variance => .{ .number = state.m2s[agg_idx] / @as(f64, @floatFromInt(n_seen)) },
-                    .stddev => .{ .number = @sqrt(state.m2s[agg_idx] / @as(f64, @floatFromInt(n_seen))) },
-                };
-                try rec.fields.put(allocator, out_name, agg_val);
-            }
-        }
+        // The aggregate columns (count() included), in SELECT order
+        try state.accum.appendResults(allocator, &rec, extra_fields);
 
         try result.append(rec);
     }
@@ -1419,24 +1309,46 @@ fn aggregateGroupBy(
     return result;
 }
 
-/// Iterator wrapper around a Scanner reading a NDJSON stream
+/// Iterator over the objects of a newline-delimited JSON stream (objects may
+/// also span lines, or sit inside a top-level array). A malformed or
+/// truncated object is skipped — counted in `skipped`, like the line-based
+/// executor does — and reading resumes with the next line.
 const NdjsonIter = struct {
     sc: *stream.Scanner,
     scratch_arena: *std.heap.ArenaAllocator,
+    skipped: ?*usize = null,
 
     pub fn next(self: *NdjsonIter) !?Record {
         while (true) {
-            const ev = self.sc.next() catch |err| switch (err) {
-                error.EndOfStream => return null,
-                else => return err,
+            var in_record = false;
+            const rec = self.nextObject(&in_record) catch |err| {
+                if (!stream.isSyntaxError(err)) return err;
+                // Garbage between records is ignored silently, matching the
+                // line-based path, which skips lines that do not start with '{'.
+                if (in_record) {
+                    if (self.skipped) |sk| sk.* += 1;
+                }
+                try self.sc.recoverAtLine();
+                continue;
             };
-            switch (ev) {
+            return rec;
+        }
+    }
+
+    fn nextObject(self: *NdjsonIter, in_record: *bool) !?Record {
+        while (true) {
+            in_record.* = self.sc.depth() > 0;
+            switch (try self.sc.next()) {
                 .end_of_input => return null,
                 .object_start => {
+                    in_record.* = true;
                     _ = self.scratch_arena.reset(.retain_capacity);
                     const rec = try collectRecord(self.scratch_arena.allocator(), self.sc);
+                    // A top-level record must end its line, as in the line-based path.
+                    if (self.sc.depth() == 0 and !try self.sc.atLineEnd()) return error.BadJson;
                     return rec;
                 },
+                // Top-level scalars and array brackets are not records.
                 else => {},
             }
         }
@@ -1469,19 +1381,6 @@ const ScopedIter = struct {
     }
 };
 
-/// Resolve the count alias from the SELECT field list (the SelectField with key=="count").
-fn resolveCountAlias(fields: ?[]const SelectField) []const u8 {
-    if (fields) |flds| {
-        for (flds) |f| {
-            if (std.mem.eql(u8, f.key, "count") and f.agg == null) {
-                if (f.alias) |a| return a;
-                return "count";
-            }
-        }
-    }
-    return ""; // empty = no count field requested
-}
-
 /// Execute a group-by query on NDJSON input.
 pub fn execGroupByNDJSON(
     allocator: std.mem.Allocator,
@@ -1491,20 +1390,30 @@ pub fn execGroupByNDJSON(
     opts: ExecOptions,
 ) !usize {
     if (q.group_by == null) return error.NoGroupByKey;
-    const count_alias = resolveCountAlias(q.fields);
 
     var sc = try stream.Scanner.init(allocator, reader);
     defer sc.deinit();
+    sc.allow_top_level_commas = true;
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
 
-    var iter = NdjsonIter{ .sc = &sc, .scratch_arena = &scratch };
-    var groups = try aggregateGroupBy(allocator, &iter, q.group_by.?, count_alias, q.fields, q.where);
+    var iter = NdjsonIter{ .sc = &sc, .scratch_arena = &scratch, .skipped = opts.skipped_records };
+    var groups = try aggregateGroupBy(allocator, &iter, q.group_by.?, q.fields, q.where);
     defer {
         for (groups.items) |*r| r.deinit();
         groups.deinit();
     }
+    return finishGroups(allocator, &groups, q, writer, opts);
+}
 
+/// HAVING → ORDER BY → LIMIT → emit, for the per-group result records.
+fn finishGroups(
+    allocator: std.mem.Allocator,
+    groups: *std.array_list.Managed(Record),
+    q: query.Query,
+    writer: *std.Io.Writer,
+    opts: ExecOptions,
+) !usize {
     // HAVING: filter group results
     if (q.having) |h| {
         var scratch_h = std.heap.ArenaAllocator.init(allocator);
@@ -1520,22 +1429,23 @@ pub fn execGroupByNDJSON(
         }
     }
 
-    // Sort if requested
-    const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, groups.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
+    if (q.order_by) |order| sortRecords(groups.items, order);
 
     const lim = q.limit orelse std.math.maxInt(usize);
     const count = @min(groups.items.len, lim);
     try emitResults(groups.items, count, writer, opts.format, opts.raw);
     return count;
+}
+
+/// Stable sort by ORDER BY keys.
+fn sortRecords(records: []Record, order: []const OrderField) void {
+    const Ctx = struct {
+        ob: []const OrderField,
+        pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
+            return compareRecords(ctx.ob, &a, &b) == .lt;
+        }
+    };
+    std.sort.block(Record, records, Ctx{ .ob = order }, Ctx.lessThan);
 }
 
 /// Execute a group-by query on scoped (wrapped array) JSON input.
@@ -1547,7 +1457,6 @@ pub fn execGroupByStream(
     opts: ExecOptions,
 ) !usize {
     if (q.group_by == null) return error.NoGroupByKey;
-    const count_alias = resolveCountAlias(q.fields);
 
     var sc = try stream.Scanner.init(allocator, reader);
     defer sc.deinit();
@@ -1570,42 +1479,12 @@ pub fn execGroupByStream(
     defer scratch.deinit();
 
     var iter = ScopedIter{ .sc = &sc, .scratch_arena = &scratch };
-    var groups = try aggregateGroupBy(allocator, &iter, q.group_by.?, count_alias, q.fields, q.where);
+    var groups = try aggregateGroupBy(allocator, &iter, q.group_by.?, q.fields, q.where);
     defer {
         for (groups.items) |*r| r.deinit();
         groups.deinit();
     }
-
-    // HAVING: filter group results
-    if (q.having) |h| {
-        var scratch_h = std.heap.ArenaAllocator.init(allocator);
-        defer scratch_h.deinit();
-        var i: usize = 0;
-        while (i < groups.items.len) {
-            if (recordPassesWhere(scratch_h.allocator(), &groups.items[i], h)) {
-                i += 1;
-            } else {
-                var removed = groups.orderedRemove(i);
-                removed.deinit();
-            }
-        }
-    }
-
-    const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, groups.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
-
-    const lim = q.limit orelse std.math.maxInt(usize);
-    const count = @min(groups.items.len, lim);
-    try emitResults(groups.items, count, writer, opts.format, opts.raw);
-    return count;
+    return finishGroups(allocator, &groups, q, writer, opts);
 }
 
 // ─── Global aggregate executor ───────────────────────────────────────────────
@@ -1617,98 +1496,18 @@ pub fn execGlobalAggNDJSON(
     writer: *std.Io.Writer,
     opts: ExecOptions,
 ) !usize {
+    if (q.fields == null) return 0;
     var sc = try stream.Scanner.init(allocator, reader);
     defer sc.deinit();
+    sc.allow_top_level_commas = true;
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
 
-    const fields = q.fields orelse return 0;
-    var n_aggs: usize = 0;
-    for (fields) |f| {
-        if (f.agg != null) n_aggs += 1;
-    }
-
-    const sums = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(sums);
-    const mins = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(mins);
-    const maxs = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(maxs);
-    const means = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(means);
-    const m2s = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(m2s);
-    const n_num = try allocator.alloc(usize, n_aggs);
-    defer allocator.free(n_num);
-    @memset(sums, 0.0);
-    @memset(mins, std.math.floatMax(f64));
-    @memset(maxs, -std.math.floatMax(f64));
-    @memset(means, 0.0);
-    @memset(m2s, 0.0);
-    @memset(n_num, 0);
-    var total_count: usize = 0;
-
-    while (true) {
-        const ev = sc.next() catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        switch (ev) {
-            .end_of_input => break,
-            .object_start => {
-                _ = scratch.reset(.retain_capacity);
-                var rec = try collectRecord(scratch.allocator(), &sc);
-                if (q.where) |w| {
-                    if (!recordPassesWhere(scratch.allocator(), &rec, w)) continue;
-                }
-                total_count += 1;
-                var agg_idx: usize = 0;
-                for (fields) |f| {
-                    if (f.agg == null) continue;
-                    defer agg_idx += 1;
-                    const val = rec.get(f.key) orelse continue;
-                    const nv: f64 = switch (val) {
-                        .number => |x| x,
-                        .string => |s| std.fmt.parseFloat(f64, s) catch continue,
-                        else => continue,
-                    };
-                    sums[agg_idx] += nv;
-                    if (nv < mins[agg_idx]) mins[agg_idx] = nv;
-                    if (nv > maxs[agg_idx]) maxs[agg_idx] = nv;
-                    n_num[agg_idx] += 1;
-                    const cnt_f: f64 = @floatFromInt(n_num[agg_idx]);
-                    const delta = nv - means[agg_idx];
-                    means[agg_idx] += delta / cnt_f;
-                    m2s[agg_idx] += delta * (nv - means[agg_idx]);
-                }
-            },
-            else => {},
-        }
-    }
-
-    var out_rec = Record.init(allocator);
-    defer out_rec.deinit();
-    const count_alias = resolveCountAlias(q.fields);
-    if (count_alias.len > 0) {
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, count_alias), .{ .number = @floatFromInt(total_count) });
-    }
-    var agg_idx: usize = 0;
-    for (fields) |f| {
-        if (f.agg == null) continue;
-        defer agg_idx += 1;
-        const agg_val: OwnedValue = if (n_num[agg_idx] == 0) .null_val else switch (f.agg.?) {
-            .sum => .{ .number = sums[agg_idx] },
-            .avg => .{ .number = sums[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .min => .{ .number = mins[agg_idx] },
-            .max => .{ .number = maxs[agg_idx] },
-            .variance => .{ .number = m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .stddev => .{ .number = @sqrt(m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx]))) },
-        };
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, if (f.alias) |a| a else f.key), agg_val);
-    }
-    var one_rec = [1]Record{out_rec};
-    try emitResults(&one_rec, 1, writer, opts.format, opts.raw);
-    return 1;
+    var agg = try GlobalAgg.init(allocator, &q);
+    defer agg.deinit(allocator);
+    var iter = NdjsonIter{ .sc = &sc, .scratch_arena = &scratch, .skipped = opts.skipped_records };
+    while (try iter.next()) |rec| _ = agg.add(scratch.allocator(), &rec);
+    return agg.emit(allocator, writer, opts);
 }
 
 // ─── LLM stream mode ────────────────────────────────────────────────────────
@@ -1734,13 +1533,14 @@ pub fn execLlmStream(
     const use_sse = opts.api_mode != null and opts.api_mode.? != .ollama;
     const sel = if (q.fields) |f| @as(?[]const SelectField, f) else null;
     const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-    const early_stop = q.limit != null and ob == null;
+    const early_stop = canStopEarly(q);
     const lim = q.limit orelse std.math.maxInt(usize);
     const fmt = if (opts.raw) OutputFormat.raw else opts.format;
 
     // When no ORDER BY and no DISTINCT, emit each matched record immediately
     // to the writer as it arrives rather than buffering for post-processing.
-    const streaming_emit = ob == null and !q.distinct and fmt != .csv and fmt != .tsv;
+    const streaming_emit = ob == null and !q.distinct and expandField(sel) == null and
+        fmt != .csv and fmt != .tsv;
     var emit_count: usize = 0;
 
     // Accumulator for the LLM token fragments
@@ -1945,79 +1745,9 @@ pub fn execLlmStream(
         return emit_count;
     }
 
-    // Post-process: sort, limit, project, emit (same as execStreamNDJSON)
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, matches.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
-
-    const count = @min(matches.items.len, lim);
-
-    var out_recs = std.array_list.Managed(Record).init(allocator);
-    defer {
-        for (out_recs.items) |*r| r.deinit();
-        out_recs.deinit();
-    }
-
-    // DISTINCT dedup set
-    var distinct_set = std.StringHashMap(void).init(allocator);
-    defer {
-        var it_ds = distinct_set.keyIterator();
-        while (it_ds.next()) |k| allocator.free(k.*);
-        distinct_set.deinit();
-    }
-
-    for (matches.items[0..count]) |*rec| {
-        var out_rec: Record = if (sel) |s|
-            try projectRecord(allocator, rec, s)
-        else
-            try copyRecord(allocator, rec);
-        errdefer out_rec.deinit();
-
-        if (q.distinct) {
-            var fp_buf = std.array_list.Managed(u8).init(allocator);
-            defer fp_buf.deinit();
-            var it2 = out_rec.fields.iterator();
-            while (it2.next()) |e| {
-                try fp_buf.appendSlice(e.key_ptr.*);
-                try fp_buf.append('=');
-                switch (e.value_ptr.*) {
-                    .string => |s| try fp_buf.appendSlice(s),
-                    .number => |n| {
-                        var tb: [32]u8 = undefined;
-                        const ns = std.fmt.bufPrint(&tb, "{d}", .{n}) catch "";
-                        try fp_buf.appendSlice(ns);
-                    },
-                    .boolean => |b| try fp_buf.appendSlice(if (b) "true" else "false"),
-                    .null_val => try fp_buf.appendSlice("null"),
-                    .raw => |r| try fp_buf.appendSlice(r),
-                }
-                try fp_buf.append(';');
-            }
-            const fp = fp_buf.items;
-            if (distinct_set.contains(fp)) {
-                out_rec.deinit();
-                continue;
-            }
-            const fp_owned = try allocator.dupe(u8, fp);
-            try distinct_set.put(fp_owned, {});
-        }
-
-        try out_recs.append(out_rec);
-    }
-
-    const out_count = out_recs.items.len;
-    try emitResults(out_recs.items, out_count, writer, opts.format, opts.raw);
-    return out_count;
+    return finalizeMatches(allocator, matches.items, q, writer, opts);
 }
 
-/// LLM global aggregate mode — accumulates token fragments into JSON objects,
-/// then runs streaming aggregation (count/sum/avg/min/max) across all extracted objects.
 pub fn execLlmGlobalAgg(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -2026,32 +1756,9 @@ pub fn execLlmGlobalAgg(
     opts: ExecOptions,
 ) !usize {
     const use_sse = opts.api_mode != null and opts.api_mode.? != .ollama;
-    const fields = q.fields orelse return 0;
-
-    var n_aggs: usize = 0;
-    for (fields) |f| {
-        if (f.agg != null) n_aggs += 1;
-    }
-
-    const sums = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(sums);
-    const mins = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(mins);
-    const maxs = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(maxs);
-    const means = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(means);
-    const m2s = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(m2s);
-    const n_num = try allocator.alloc(usize, n_aggs);
-    defer allocator.free(n_num);
-    @memset(sums, 0.0);
-    @memset(mins, std.math.floatMax(f64));
-    @memset(maxs, -std.math.floatMax(f64));
-    @memset(means, 0.0);
-    @memset(m2s, 0.0);
-    @memset(n_num, 0);
-    var total_count: usize = 0;
+    if (q.fields == null) return 0;
+    var agg = try GlobalAgg.init(allocator, &q);
+    defer agg.deinit(allocator);
 
     var accum = std.array_list.Managed(u8).init(allocator);
     defer accum.deinit();
@@ -2145,64 +1852,15 @@ pub fn execLlmGlobalAgg(
 
             drainAccum(&accum, obj_span.end);
 
-            if (q.where) |w| {
-                if (!recordPassesWhere(scratch.allocator(), &rec, w)) continue;
-            }
-
-            total_count += 1;
-            var agg_idx: usize = 0;
-            for (fields) |f| {
-                if (f.agg == null) continue;
-                defer agg_idx += 1;
-                const val = rec.get(f.key) orelse continue;
-                const nv: f64 = switch (val) {
-                    .number => |x| x,
-                    .string => |s| std.fmt.parseFloat(f64, s) catch continue,
-                    else => continue,
-                };
-                sums[agg_idx] += nv;
-                if (nv < mins[agg_idx]) mins[agg_idx] = nv;
-                if (nv > maxs[agg_idx]) maxs[agg_idx] = nv;
-                n_num[agg_idx] += 1;
-                const cnt_f_llm: f64 = @floatFromInt(n_num[agg_idx]);
-                const delta_llm = nv - means[agg_idx];
-                means[agg_idx] += delta_llm / cnt_f_llm;
-                m2s[agg_idx] += delta_llm * (nv - means[agg_idx]);
-            }
+            if (!agg.add(scratch.allocator(), &rec)) continue;
 
             // --rolling: emit a snapshot of the running aggregates after each object
-            if (opts.rolling) {
-                try emitAggSnapshot(writer, fields, total_count, sums, mins, maxs, m2s, n_num, resolveCountAlias(q.fields));
-                try writer.flush();
-            }
+            if (opts.rolling) try agg.emitSnapshot(allocator, writer);
         }
     }
 
-    var out_rec = Record.init(allocator);
-    defer out_rec.deinit();
-    const count_alias = resolveCountAlias(q.fields);
-    if (count_alias.len > 0) {
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, count_alias), .{ .number = @floatFromInt(total_count) });
-    }
-    var agg_idx: usize = 0;
-    for (fields) |f| {
-        if (f.agg == null) continue;
-        defer agg_idx += 1;
-        const agg_val: OwnedValue = if (n_num[agg_idx] == 0) .null_val else switch (f.agg.?) {
-            .sum => .{ .number = sums[agg_idx] },
-            .avg => .{ .number = sums[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .min => .{ .number = mins[agg_idx] },
-            .max => .{ .number = maxs[agg_idx] },
-            .variance => .{ .number = m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .stddev => .{ .number = @sqrt(m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx]))) },
-        };
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, if (f.alias) |a| a else f.key), agg_val);
-    }
-    var one_rec = [1]Record{out_rec};
-    if (!opts.rolling) {
-        try emitResults(&one_rec, 1, writer, opts.format, opts.raw);
-    }
-    return 1;
+    if (opts.rolling) return 1;
+    return agg.emit(allocator, writer, opts);
 }
 
 /// LLM group-by mode — accumulates token fragments, extracts objects, aggregates by group.
@@ -2215,7 +1873,6 @@ pub fn execLlmGroupBy(
 ) !usize {
     const use_sse = opts.api_mode != null and opts.api_mode.? != .ollama;
     if (q.group_by == null) return error.NoGroupByKey;
-    const count_alias = resolveCountAlias(q.fields);
 
     var accum = std.array_list.Managed(u8).init(allocator);
     defer accum.deinit();
@@ -2325,7 +1982,7 @@ pub fn execLlmGroupBy(
             // --rolling: re-aggregate and emit snapshot after each new object
             if (opts.rolling) {
                 var snap_iter = SliceIter{ .records = collected.items, .idx = 0 };
-                var snap_groups = try aggregateGroupBy(allocator, &snap_iter, q.group_by.?, count_alias, q.fields, null);
+                var snap_groups = try aggregateGroupBy(allocator, &snap_iter, q.group_by.?, q.fields, null);
                 defer {
                     for (snap_groups.items) |*sr| sr.deinit();
                     snap_groups.deinit();
@@ -2341,44 +1998,14 @@ pub fn execLlmGroupBy(
     // In rolling mode, the final result was already emitted incrementally,
     // but we still emit the final summary for consistency.
     var iter = SliceIter{ .records = collected.items, .idx = 0 };
-    var groups = try aggregateGroupBy(allocator, &iter, q.group_by.?, count_alias, q.fields, null);
+    var groups = try aggregateGroupBy(allocator, &iter, q.group_by.?, q.fields, null);
     defer {
         for (groups.items) |*r| r.deinit();
         groups.deinit();
     }
 
-    // HAVING: filter group results
-    if (q.having) |h| {
-        var scratch_h = std.heap.ArenaAllocator.init(allocator);
-        defer scratch_h.deinit();
-        var i: usize = 0;
-        while (i < groups.items.len) {
-            if (recordPassesWhere(scratch_h.allocator(), &groups.items[i], h)) {
-                i += 1;
-            } else {
-                var removed = groups.orderedRemove(i);
-                removed.deinit();
-            }
-        }
-    }
-
-    const ob_fields = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-    if (ob_fields) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, groups.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
-
-    const final_lim = q.limit orelse std.math.maxInt(usize);
-    const final_count = @min(groups.items.len, final_lim);
-    if (!opts.rolling) {
-        try emitResults(groups.items, final_count, writer, opts.format, opts.raw);
-    }
-    return final_count;
+    if (opts.rolling) return groups.items.len;
+    return finishGroups(allocator, &groups, q, writer, opts);
 }
 
 /// Simple slice-based record iterator for feeding pre-collected records into aggregateGroupBy.
@@ -2434,9 +2061,7 @@ pub fn execGenericSource(
     writer: *std.Io.Writer,
     opts: ExecOptions,
 ) !usize {
-    const sel = if (q.fields) |f| @as(?[]const SelectField, f) else null;
-    const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-    const early_stop = q.limit != null and ob == null;
+    const early_stop = canStopEarly(q);
     const lim = q.limit orelse std.math.maxInt(usize);
 
     var matches = std.array_list.Managed(Record).init(allocator);
@@ -2449,7 +2074,8 @@ pub fn execGenericSource(
     defer scratch.deinit();
 
     // Consume records from the source
-    while (try source.next()) |rec_val| {
+    while (!(early_stop and matches.items.len >= lim)) {
+        const rec_val = try source.next() orelse break;
         _ = scratch.reset(.retain_capacity);
         var rec = rec_val;
 
@@ -2465,80 +2091,9 @@ pub fn execGenericSource(
         const full_rec = try copyRecordFull(allocator, &rec);
         rec.deinit();
         try matches.append(full_rec);
-
-        if (early_stop and matches.items.len >= lim) break;
     }
 
-    // Sort
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, matches.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
-
-    const count = @min(matches.items.len, lim);
-
-    // Project into output records
-    var out_recs = std.array_list.Managed(Record).init(allocator);
-    defer {
-        for (out_recs.items) |*r| r.deinit();
-        out_recs.deinit();
-    }
-
-    // DISTINCT dedup set
-    var distinct_set = std.StringHashMap(void).init(allocator);
-    defer {
-        var it_ds = distinct_set.keyIterator();
-        while (it_ds.next()) |k| allocator.free(k.*);
-        distinct_set.deinit();
-    }
-
-    for (matches.items[0..count]) |*rec| {
-        var out_rec: Record = if (sel) |s|
-            try projectRecord(allocator, rec, s)
-        else
-            try copyRecord(allocator, rec);
-        errdefer out_rec.deinit();
-
-        if (q.distinct) {
-            var fp_buf = std.array_list.Managed(u8).init(allocator);
-            defer fp_buf.deinit();
-            var it2 = out_rec.fields.iterator();
-            while (it2.next()) |e| {
-                try fp_buf.appendSlice(e.key_ptr.*);
-                try fp_buf.append('=');
-                switch (e.value_ptr.*) {
-                    .string => |s| try fp_buf.appendSlice(s),
-                    .number => |n| {
-                        var tb: [32]u8 = undefined;
-                        const ns = std.fmt.bufPrint(&tb, "{d}", .{n}) catch "";
-                        try fp_buf.appendSlice(ns);
-                    },
-                    .boolean => |b| try fp_buf.appendSlice(if (b) "true" else "false"),
-                    .null_val => try fp_buf.appendSlice("null"),
-                    .raw => |r| try fp_buf.appendSlice(r),
-                }
-                try fp_buf.append(';');
-            }
-            const fp = fp_buf.items;
-            if (distinct_set.contains(fp)) {
-                out_rec.deinit();
-                continue;
-            }
-            const fp_owned = try allocator.dupe(u8, fp);
-            try distinct_set.put(fp_owned, {});
-        }
-
-        try out_recs.append(out_rec);
-    }
-
-    const out_count = out_recs.items.len;
-    try emitResults(out_recs.items, out_count, writer, opts.format, opts.raw);
-    return out_count;
+    return finalizeMatches(allocator, matches.items, q, writer, opts);
 }
 
 /// Generic GROUP BY executor. Works with any record source.
@@ -2550,7 +2105,6 @@ pub fn execGenericGroupBy(
     opts: ExecOptions,
 ) !usize {
     if (q.group_by == null) return error.NoGroupByKey;
-    const count_alias = resolveCountAlias(q.fields);
 
     // Wrap source in a deiniting iterator that frees each record after the
     // next one is requested. aggregateGroupBy was designed for arena-backed
@@ -2561,7 +2115,7 @@ pub fn execGenericGroupBy(
         .inner = source,
         .prev = null,
     };
-    var groups = try aggregateGroupBy(allocator, &deinit_iter, q.group_by.?, count_alias, q.fields, q.where);
+    var groups = try aggregateGroupBy(allocator, &deinit_iter, q.group_by.?, q.fields, q.where);
     // Deinit the last record if any
     if (deinit_iter.prev) |*p| p.deinit();
     defer {
@@ -2569,36 +2123,7 @@ pub fn execGenericGroupBy(
         groups.deinit();
     }
 
-    // HAVING: filter group results
-    if (q.having) |h| {
-        var scratch_h = std.heap.ArenaAllocator.init(allocator);
-        defer scratch_h.deinit();
-        var i: usize = 0;
-        while (i < groups.items.len) {
-            if (recordPassesWhere(scratch_h.allocator(), &groups.items[i], h)) {
-                i += 1;
-            } else {
-                var removed = groups.orderedRemove(i);
-                removed.deinit();
-            }
-        }
-    }
-
-    const ob = if (q.order_by) |o| @as(?[]const OrderField, o) else null;
-    if (ob) |order| {
-        const Ctx = struct {
-            ob: []const OrderField,
-            pub fn lessThan(ctx: @This(), a: Record, b: Record) bool {
-                return compareRecords(ctx.ob, &a, &b) == .lt;
-            }
-        };
-        std.sort.block(Record, groups.items, Ctx{ .ob = order }, Ctx.lessThan);
-    }
-
-    const lim = q.limit orelse std.math.maxInt(usize);
-    const count = @min(groups.items.len, lim);
-    try emitResults(groups.items, count, writer, opts.format, opts.raw);
-    return count;
+    return finishGroups(allocator, &groups, q, writer, opts);
 }
 
 /// Generic global aggregate executor. Works with any record source.
@@ -2609,31 +2134,9 @@ pub fn execGenericGlobalAgg(
     writer: *std.Io.Writer,
     opts: ExecOptions,
 ) !usize {
-    const fields = q.fields orelse return 0;
-    var n_aggs: usize = 0;
-    for (fields) |f| {
-        if (f.agg != null) n_aggs += 1;
-    }
-
-    const sums = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(sums);
-    const mins = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(mins);
-    const maxs = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(maxs);
-    const means = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(means);
-    const m2s = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(m2s);
-    const n_num = try allocator.alloc(usize, n_aggs);
-    defer allocator.free(n_num);
-    @memset(sums, 0.0);
-    @memset(mins, std.math.floatMax(f64));
-    @memset(maxs, -std.math.floatMax(f64));
-    @memset(means, 0.0);
-    @memset(m2s, 0.0);
-    @memset(n_num, 0);
-    var total_count: usize = 0;
+    if (q.fields == null) return 0;
+    var agg = try GlobalAgg.init(allocator, &q);
+    defer agg.deinit(allocator);
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
@@ -2642,63 +2145,12 @@ pub fn execGenericGlobalAgg(
         _ = scratch.reset(.retain_capacity);
         var rec = rec_val;
         defer rec.deinit();
-
-        if (q.where) |w| {
-            if (!recordPassesWhere(scratch.allocator(), &rec, w)) continue;
-        }
-
-        total_count += 1;
-        var agg_idx: usize = 0;
-        for (fields) |f| {
-            if (f.agg == null) continue;
-            defer agg_idx += 1;
-            const val = rec.get(f.key) orelse continue;
-            const nv: f64 = switch (val) {
-                .number => |x| x,
-                .string => |s| std.fmt.parseFloat(f64, s) catch continue,
-                else => continue,
-            };
-            sums[agg_idx] += nv;
-            if (nv < mins[agg_idx]) mins[agg_idx] = nv;
-            if (nv > maxs[agg_idx]) maxs[agg_idx] = nv;
-            n_num[agg_idx] += 1;
-            const cnt_f_gen: f64 = @floatFromInt(n_num[agg_idx]);
-            const delta_gen = nv - means[agg_idx];
-            means[agg_idx] += delta_gen / cnt_f_gen;
-            m2s[agg_idx] += delta_gen * (nv - means[agg_idx]);
-        }
-
-        if (opts.rolling) {
-            try emitAggSnapshot(writer, fields, total_count, sums, mins, maxs, m2s, n_num, resolveCountAlias(q.fields));
-            try writer.flush();
-        }
+        if (!agg.add(scratch.allocator(), &rec)) continue;
+        if (opts.rolling) try agg.emitSnapshot(allocator, writer);
     }
 
-    var out_rec = Record.init(allocator);
-    defer out_rec.deinit();
-    const count_alias = resolveCountAlias(q.fields);
-    if (count_alias.len > 0) {
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, count_alias), .{ .number = @floatFromInt(total_count) });
-    }
-    var agg_idx: usize = 0;
-    for (fields) |f| {
-        if (f.agg == null) continue;
-        defer agg_idx += 1;
-        const agg_val: OwnedValue = if (n_num[agg_idx] == 0) .null_val else switch (f.agg.?) {
-            .sum => .{ .number = sums[agg_idx] },
-            .avg => .{ .number = sums[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .min => .{ .number = mins[agg_idx] },
-            .max => .{ .number = maxs[agg_idx] },
-            .variance => .{ .number = m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .stddev => .{ .number = @sqrt(m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx]))) },
-        };
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, if (f.alias) |a| a else f.key), agg_val);
-    }
-    var one_rec = [1]Record{out_rec};
-    if (!opts.rolling) {
-        try emitResults(&one_rec, 1, writer, opts.format, opts.raw);
-    }
-    return 1;
+    if (opts.rolling) return 1;
+    return agg.emit(allocator, writer, opts);
 }
 
 pub fn execGlobalAggStream(
@@ -2722,92 +2174,12 @@ pub fn execGlobalAggStream(
     const found = try navigateToArray(&sc, nav_path);
     if (!found) return 0;
 
-    const fields = q.fields orelse return 0;
-    var n_aggs: usize = 0;
-    for (fields) |f| {
-        if (f.agg != null) n_aggs += 1;
-    }
-    const sums = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(sums);
-    const mins = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(mins);
-    const maxs = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(maxs);
-    const means = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(means);
-    const m2s = try allocator.alloc(f64, n_aggs);
-    defer allocator.free(m2s);
-    const n_num = try allocator.alloc(usize, n_aggs);
-    defer allocator.free(n_num);
-    @memset(sums, 0.0);
-    @memset(mins, std.math.floatMax(f64));
-    @memset(maxs, -std.math.floatMax(f64));
-    @memset(means, 0.0);
-    @memset(m2s, 0.0);
-    @memset(n_num, 0);
-    var total_count: usize = 0;
-
-    while (true) {
-        const ev = sc.next() catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        switch (ev) {
-            .array_end, .end_of_input => break,
-            .object_start => {
-                _ = scratch.reset(.retain_capacity);
-                var rec = try collectRecord(scratch.allocator(), &sc);
-                if (q.where) |w| {
-                    if (!recordPassesWhere(scratch.allocator(), &rec, w)) continue;
-                }
-                total_count += 1;
-                var agg_idx: usize = 0;
-                for (fields) |f| {
-                    if (f.agg == null) continue;
-                    defer agg_idx += 1;
-                    const val = rec.get(f.key) orelse continue;
-                    const nv: f64 = switch (val) {
-                        .number => |x| x,
-                        .string => |s| std.fmt.parseFloat(f64, s) catch continue,
-                        else => continue,
-                    };
-                    sums[agg_idx] += nv;
-                    if (nv < mins[agg_idx]) mins[agg_idx] = nv;
-                    if (nv > maxs[agg_idx]) maxs[agg_idx] = nv;
-                    n_num[agg_idx] += 1;
-                    const cnt_f_sc: f64 = @floatFromInt(n_num[agg_idx]);
-                    const delta_sc = nv - means[agg_idx];
-                    means[agg_idx] += delta_sc / cnt_f_sc;
-                    m2s[agg_idx] += delta_sc * (nv - means[agg_idx]);
-                }
-            },
-            else => {},
-        }
-    }
-
-    var out_rec = Record.init(allocator);
-    defer out_rec.deinit();
-    const count_alias = resolveCountAlias(q.fields);
-    if (count_alias.len > 0) {
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, count_alias), .{ .number = @floatFromInt(total_count) });
-    }
-    var agg_idx: usize = 0;
-    for (fields) |f| {
-        if (f.agg == null) continue;
-        defer agg_idx += 1;
-        const agg_val: OwnedValue = if (n_num[agg_idx] == 0) .null_val else switch (f.agg.?) {
-            .sum => .{ .number = sums[agg_idx] },
-            .avg => .{ .number = sums[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .min => .{ .number = mins[agg_idx] },
-            .max => .{ .number = maxs[agg_idx] },
-            .variance => .{ .number = m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])) },
-            .stddev => .{ .number = @sqrt(m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx]))) },
-        };
-        try out_rec.fields.put(allocator, try allocator.dupe(u8, if (f.alias) |a| a else f.key), agg_val);
-    }
-    var one_rec = [1]Record{out_rec};
-    try emitResults(&one_rec, 1, writer, opts.format, opts.raw);
-    return 1;
+    if (q.fields == null) return 0;
+    var agg = try GlobalAgg.init(allocator, &q);
+    defer agg.deinit(allocator);
+    var iter = ScopedIter{ .sc = &sc, .scratch_arena = &scratch };
+    while (try iter.next()) |rec| _ = agg.add(scratch.allocator(), &rec);
+    return agg.emit(allocator, writer, opts);
 }
 
 // ─── TESTS ───────────────────────────────────────────────────────────────────
@@ -2926,8 +2298,8 @@ test "stream exec: limit stops early" {
     }
 
     try std.testing.expectEqual(@as(usize, 3), matches.items.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), matches.items[0].get("id").?.number, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, 3), matches.items[2].get("id").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), matches.items[0].get("id").?.number.f, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), matches.items[2].get("id").?.number.f, 0.01);
 }
 
 test "stream exec: nested field access in where and select" {

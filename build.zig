@@ -261,6 +261,20 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(stream_tests).step);
 
+    // `zig build fuzz --fuzz[=iterations]` fuzzes the JSON scanner: it checks
+    // the scanner against its non-allocating validator and against std.json.
+    // Built with LLVM, which emits the coverage instrumentation the fuzzer needs.
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stream.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+        .use_llvm = true,
+    });
+    const fuzz_step = b.step("fuzz", "Fuzz the JSON scanner (run with --fuzz)");
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
     const regex_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/core/regex.zig"),

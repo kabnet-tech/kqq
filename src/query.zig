@@ -60,7 +60,7 @@ const isKeywordIdent = tokenizer_mod.isKeywordIdent;
 // ---- PARSER ----------------------------------------------------------------
 // ---- PARSER ----------------------------------------------------------------
 
-pub const ParseError = error{ UnexpectedToken, UnexpectedChar, OutOfMemory };
+pub const ParseError = error{ UnexpectedToken, UnexpectedChar, UnknownFunction, OutOfMemory };
 
 fn parseGlobKey(
     allocator: std.mem.Allocator,
@@ -145,7 +145,8 @@ fn isFuncKeyword(tag: TokTag) ?FuncName {
     };
 }
 
-/// Map a bare string (as returned by parseGlobKey) to a FuncName if it matches.
+/// Map a function name (case-insensitive) to a FuncName. Covers names that
+/// are not keywords too (`ifhas`), so `ident(` can be resolved as a call.
 fn funcNameFromStr(s: []const u8) ?FuncName {
     const names = .{
         .{ "upper", FuncName.upper },                 .{ "lower", FuncName.lower },
@@ -165,188 +166,270 @@ fn funcNameFromStr(s: []const u8) ?FuncName {
         .{ "to_epoch_ms", FuncName.to_epoch_ms },     .{ "date_part", FuncName.date_part },
         .{ "epoch_min", FuncName.epoch_min },         .{ "epoch_hour", FuncName.epoch_hour },
         .{ "epoch_day", FuncName.epoch_day },         .{ "epoch_week", FuncName.epoch_week },
+        .{ "ifhas", FuncName.ifhas },
     };
     inline for (names) |pair| {
-        if (std.mem.eql(u8, s, pair[0])) return pair[1];
+        if (std.ascii.eqlIgnoreCase(s, pair[0])) return pair[1];
     }
     return null;
 }
 
-/// Returns true if this token can start an expression.
-fn canStartExpr(tag: TokTag) bool {
-    return switch (tag) {
-        .number, .string, .lparen, .ident, .kw_case => true,
-        else => isFuncKeyword(tag) != null,
+fn destroyExpr(allocator: std.mem.Allocator, e: *Expr) void {
+    e.deinit(allocator);
+    allocator.destroy(e);
+}
+
+/// Build `lhs <op> rhs`, taking ownership of both operands (freed on failure).
+fn newBinary(allocator: std.mem.Allocator, op: TokTag, lhs: *Expr, rhs: *Expr) ParseError!*Expr {
+    const node = allocator.create(Expr) catch {
+        destroyExpr(allocator, lhs);
+        destroyExpr(allocator, rhs);
+        return error.OutOfMemory;
+    };
+    const bin = BinExpr{ .lhs = lhs, .rhs = rhs };
+    node.* = switch (op) {
+        .op_plus => .{ .add = bin },
+        .op_minus => .{ .sub = bin },
+        .star => .{ .mul = bin },
+        .op_div => .{ .div = bin },
+        .op_mod => .{ .mod = bin },
+        else => unreachable,
+    };
+    return node;
+}
+
+/// Build coalesce(lhs, rhs) — the desugaring of `lhs // rhs`.
+fn newCoalesce(allocator: std.mem.Allocator, lhs: *Expr, rhs: *Expr) ParseError!*Expr {
+    const args = allocator.alloc(*Expr, 2) catch {
+        destroyExpr(allocator, lhs);
+        destroyExpr(allocator, rhs);
+        return error.OutOfMemory;
+    };
+    const node = allocator.create(Expr) catch {
+        allocator.free(args);
+        destroyExpr(allocator, lhs);
+        destroyExpr(allocator, rhs);
+        return error.OutOfMemory;
+    };
+    args[0] = lhs;
+    args[1] = rhs;
+    node.* = .{ .func = .{ .name = .coalesce, .args = args } };
+    return node;
+}
+
+/// A negative number token right after an operand (`a -1`): the tokenizer
+/// glued the minus to the digits, but it is a subtraction.
+fn isGluedMinus(t: Token) bool {
+    return t.tag == .number and t.text.len > 1 and t.text[0] == '-';
+}
+
+/// True if `t` continues an expression after an operand.
+fn isArithOp(t: Token) bool {
+    return switch (t.tag) {
+        .op_plus, .op_minus, .star, .op_div, .op_mod, .op_alt => true,
+        else => isGluedMinus(t),
     };
 }
 
 fn parseExpr(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!*Expr {
-    var lhs = try parseAdd(allocator, tok, cur);
+    return parseExprFrom(allocator, tok, cur, try parsePrimary(allocator, tok, cur));
+}
+
+/// Finish an expression whose leftmost operand `first` is already parsed.
+/// Precedence: `* / %` bind tighter than `+ -`, which bind tighter than `//`.
+/// Takes ownership of `first` (freed on error).
+fn parseExprFrom(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, first: *Expr) ParseError!*Expr {
+    var lhs = try parseAddFrom(allocator, tok, cur, first);
     // // (alternative) has lower precedence than arithmetic; desugar to coalesce(lhs, rhs)
     while (cur.tag == .op_alt) {
-        cur.* = try tok.next();
-        const rhs = try parseAdd(allocator, tok, cur);
-        const args = allocator.alloc(*Expr, 2) catch {
-            rhs.deinit(allocator);
-            allocator.destroy(rhs);
-            lhs.deinit(allocator);
-            allocator.destroy(lhs);
-            return error.OutOfMemory;
+        cur.* = tok.next() catch |e| {
+            destroyExpr(allocator, lhs);
+            return e;
         };
-        args[0] = lhs;
-        args[1] = rhs;
-        const node = try allocator.create(Expr);
-        node.* = .{ .func = .{ .name = .coalesce, .args = args } };
-        lhs = node;
+        const rhs = parseAdd(allocator, tok, cur) catch |e| {
+            destroyExpr(allocator, lhs);
+            return e;
+        };
+        lhs = try newCoalesce(allocator, lhs, rhs);
     }
     return lhs;
 }
 
 fn parseAdd(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!*Expr {
-    var lhs = try parseMul(allocator, tok, cur);
-    while (cur.tag == .op_plus or cur.tag == .op_minus) {
-        const op = cur.tag;
-        cur.* = try tok.next();
-        const rhs = try parseMul(allocator, tok, cur);
-        const node = try allocator.create(Expr);
-        const bin = BinExpr{ .lhs = lhs, .rhs = rhs };
-        node.* = if (op == .op_plus) .{ .add = bin } else .{ .sub = bin };
-        lhs = node;
+    return parseAddFrom(allocator, tok, cur, try parsePrimary(allocator, tok, cur));
+}
+
+fn parseAddFrom(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, first: *Expr) ParseError!*Expr {
+    var lhs = try parseMulFrom(allocator, tok, cur, first);
+    while (cur.tag == .op_plus or cur.tag == .op_minus or isGluedMinus(cur.*)) {
+        // `a -1`: keep the (negative) literal as the right operand of an addition.
+        const op: TokTag = if (cur.tag == .number) .op_plus else cur.tag;
+        if (cur.tag != .number) {
+            cur.* = tok.next() catch |e| {
+                destroyExpr(allocator, lhs);
+                return e;
+            };
+        }
+        const rhs = parseMul(allocator, tok, cur) catch |e| {
+            destroyExpr(allocator, lhs);
+            return e;
+        };
+        lhs = try newBinary(allocator, op, lhs, rhs);
     }
     return lhs;
 }
 
 fn parseMul(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!*Expr {
-    var lhs = try parsePrimary(allocator, tok, cur);
+    return parseMulFrom(allocator, tok, cur, try parsePrimary(allocator, tok, cur));
+}
+
+fn parseMulFrom(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, first: *Expr) ParseError!*Expr {
+    var lhs = first;
     while (cur.tag == .star or cur.tag == .op_div or cur.tag == .op_mod) {
         const op = cur.tag;
-        cur.* = try tok.next();
-        const rhs = try parsePrimary(allocator, tok, cur);
-        const node = try allocator.create(Expr);
-        const bin = BinExpr{ .lhs = lhs, .rhs = rhs };
-        node.* = switch (op) {
-            .star => .{ .mul = bin },
-            .op_div => .{ .div = bin },
-            .op_mod => .{ .mod = bin },
-            else => unreachable,
+        cur.* = tok.next() catch |e| {
+            destroyExpr(allocator, lhs);
+            return e;
         };
-        lhs = node;
+        const rhs = parsePrimary(allocator, tok, cur) catch |e| {
+            destroyExpr(allocator, lhs);
+            return e;
+        };
+        lhs = try newBinary(allocator, op, lhs, rhs);
     }
     return lhs;
 }
 
-fn parsePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!*Expr {
-    // Number literal
-    if (cur.tag == .number) {
-        const n = std.fmt.parseFloat(f64, cur.text) catch return error.UnexpectedToken;
-        cur.* = try tok.next();
-        const node = try allocator.create(Expr);
-        node.* = .{ .lit_num = n };
-        return node;
+/// Parse `( args... )` of a call to `name`; `cur` is at the '('.
+fn parseCall(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, name: FuncName) ParseError!*Expr {
+    if (cur.tag != .lparen) return error.UnexpectedToken;
+    cur.* = try tok.next();
+    var args = std.array_list.Managed(*Expr).init(allocator);
+    errdefer {
+        for (args.items) |a| destroyExpr(allocator, a);
+        args.deinit();
     }
-    // String literal
-    if (cur.tag == .string) {
-        const s = try allocator.dupe(u8, cur.text);
-        cur.* = try tok.next();
-        const node = try allocator.create(Expr);
-        node.* = .{ .lit_str = s };
-        return node;
-    }
-    // Grouped expression
-    if (cur.tag == .lparen) {
-        cur.* = try tok.next();
-        const inner = try parseExpr(allocator, tok, cur);
-        if (cur.tag != .rparen) {
-            inner.deinit(allocator);
-            allocator.destroy(inner);
-            return error.UnexpectedToken;
-        }
-        cur.* = try tok.next();
-        return inner;
-    }
-    // Function call: FUNC '(' args... ')'
-    if (isFuncKeyword(cur.tag)) |fn_name| {
-        cur.* = try tok.next();
-        if (cur.tag != .lparen) return error.UnexpectedToken;
-        cur.* = try tok.next();
-        var args = std.array_list.Managed(*Expr).init(allocator);
-        errdefer {
-            for (args.items) |a| {
-                a.deinit(allocator);
-                allocator.destroy(a);
-            }
-            args.deinit();
-        }
-        while (cur.tag != .rparen and cur.tag != .eof) {
+    if (cur.tag != .rparen) {
+        while (true) {
             const arg = try parseExpr(allocator, tok, cur);
-            try args.append(arg);
-            if (cur.tag == .comma) cur.* = try tok.next();
+            args.append(arg) catch {
+                destroyExpr(allocator, arg);
+                return error.OutOfMemory;
+            };
+            if (cur.tag != .comma) break;
+            cur.* = try tok.next();
         }
-        if (cur.tag != .rparen) return error.UnexpectedToken;
+    }
+    if (cur.tag != .rparen) return error.UnexpectedToken;
+    cur.* = try tok.next();
+    const node = try allocator.create(Expr);
+    errdefer allocator.destroy(node);
+    node.* = .{ .func = .{ .name = name, .args = try args.toOwnedSlice() } };
+    return node;
+}
+
+/// Resolve `name(` to a function, or fail with UnknownFunction pointing at the name.
+fn lookupFunction(tok: *Tokenizer, name_tok: Token) ParseError!FuncName {
+    return funcNameFromStr(name_tok.text) orelse {
+        tok.err_pos = name_tok.start;
+        return error.UnknownFunction;
+    };
+}
+
+fn parsePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!*Expr {
+    switch (cur.tag) {
+        .number => {
+            const n = std.fmt.parseFloat(f64, cur.text) catch return error.UnexpectedToken;
+            cur.* = try tok.next();
+            const node = try allocator.create(Expr);
+            node.* = .{ .lit_num = n };
+            return node;
+        },
+        .string => {
+            const s = try allocator.dupe(u8, cur.text);
+            errdefer allocator.free(s);
+            cur.* = try tok.next();
+            const node = try allocator.create(Expr);
+            node.* = .{ .lit_str = s };
+            return node;
+        },
+        // Grouped expression
+        .lparen => {
+            cur.* = try tok.next();
+            const inner = try parseExpr(allocator, tok, cur);
+            if (cur.tag != .rparen) {
+                destroyExpr(allocator, inner);
+                return error.UnexpectedToken;
+            }
+            cur.* = tok.next() catch |e| {
+                destroyExpr(allocator, inner);
+                return e;
+            };
+            return inner;
+        },
+        // CASE WHEN c1 THEN e1 [WHEN c2 THEN e2 ...] [ELSE eN] END
+        .kw_case => {
+            cur.* = try tok.next();
+            var arms = std.array_list.Managed(CaseArm).init(allocator);
+            errdefer {
+                for (arms.items) |*arm| {
+                    arm.cond.deinit(allocator);
+                    destroyExpr(allocator, arm.result);
+                }
+                arms.deinit();
+            }
+            var else_expr: ?*Expr = null;
+            errdefer if (else_expr) |e| destroyExpr(allocator, e);
+            while (cur.tag == .kw_when) {
+                cur.* = try tok.next();
+                const arm_cond = try parseWhereOr(allocator, tok, cur);
+                errdefer arm_cond.deinit(allocator);
+                if (cur.tag != .kw_then) return error.UnexpectedToken;
+                cur.* = try tok.next();
+                const result_expr = try parseExpr(allocator, tok, cur);
+                arms.append(.{ .cond = arm_cond, .result = result_expr }) catch {
+                    destroyExpr(allocator, result_expr);
+                    return error.OutOfMemory;
+                };
+            }
+            if (arms.items.len == 0) return error.UnexpectedToken;
+            if (cur.tag == .kw_else) {
+                cur.* = try tok.next();
+                else_expr = try parseExpr(allocator, tok, cur);
+            }
+            if (cur.tag != .kw_end) return error.UnexpectedToken;
+            cur.* = try tok.next();
+            const node = try allocator.create(Expr);
+            errdefer allocator.destroy(node);
+            node.* = .{ .case_when = .{ .arms = try arms.toOwnedSlice(), .else_expr = else_expr } };
+            return node;
+        },
+        else => {},
+    }
+    // A name: a function call when followed by '(', otherwise a field
+    // reference `seg('.' seg)*`. Any keyword can name a field (`count`, `type`).
+    if (!isKeywordIdent(cur.tag)) return error.UnexpectedToken;
+    const name_tok = cur.*;
+    cur.* = try tok.next();
+    if (cur.tag == .lparen) {
+        const fn_name = isFuncKeyword(name_tok.tag) orelse try lookupFunction(tok, name_tok);
+        return parseCall(allocator, tok, cur, fn_name);
+    }
+    var buf = std.array_list.Managed(u8).init(allocator);
+    errdefer buf.deinit();
+    try buf.appendSlice(name_tok.text);
+    while (cur.tag == .dot) {
         cur.* = try tok.next();
-        const node = try allocator.create(Expr);
-        node.* = .{ .func = .{ .name = fn_name, .args = try args.toOwnedSlice() } };
-        return node;
-    }
-    // Field reference: ident ('.' ident)*
-    if (cur.tag == .ident or isFuncKeyword(cur.tag) != null) {
-        // handled above; this catches plain idents
-    }
-    if (cur.tag == .ident) {
-        var buf = std.array_list.Managed(u8).init(allocator);
-        errdefer buf.deinit();
+        if (!isKeywordIdent(cur.tag) or cur.tag == .number) return error.UnexpectedToken;
+        try buf.append('.');
         try buf.appendSlice(cur.text);
         cur.* = try tok.next();
-        while (cur.tag == .dot) {
-            cur.* = try tok.next();
-            if (cur.tag != .ident) return error.UnexpectedToken;
-            try buf.appendSlice(".");
-            try buf.appendSlice(cur.text);
-            cur.* = try tok.next();
-        }
-        const field_name = try buf.toOwnedSlice();
-        const node = try allocator.create(Expr);
-        node.* = .{ .field = field_name };
-        return node;
     }
-    // CASE WHEN c1 THEN e1 [WHEN c2 THEN e2 ...] [ELSE eN] END
-    if (cur.tag == .kw_case) {
-        cur.* = try tok.next();
-        var arms = std.array_list.Managed(CaseArm).init(allocator);
-        errdefer {
-            for (arms.items) |*arm| {
-                arm.cond.deinit(allocator);
-                arm.result.deinit(allocator);
-                allocator.destroy(arm.result);
-            }
-            arms.deinit();
-        }
-        var else_expr: ?*Expr = null;
-        errdefer if (else_expr) |e| {
-            e.deinit(allocator);
-            allocator.destroy(e);
-        };
-        while (cur.tag == .kw_when) {
-            cur.* = try tok.next();
-            var arm_cond: ?WhereClause = try parseWhereOr(allocator, tok, cur);
-            errdefer if (arm_cond) |wc| wc.deinit(allocator);
-            if (cur.tag != .kw_then) return error.UnexpectedToken;
-            cur.* = try tok.next();
-            const result_expr = try parseExpr(allocator, tok, cur);
-            try arms.append(.{ .cond = arm_cond.?, .result = result_expr });
-            arm_cond = null; // ownership transferred to arms
-        }
-        if (cur.tag == .kw_else) {
-            cur.* = try tok.next();
-            else_expr = try parseExpr(allocator, tok, cur);
-        }
-        if (cur.tag != .kw_end) return error.UnexpectedToken;
-        cur.* = try tok.next();
-        const node = try allocator.create(Expr);
-        node.* = .{ .case_when = .{ .arms = try arms.toOwnedSlice(), .else_expr = else_expr } };
-        return node;
-    }
-    return error.UnexpectedToken;
+    const field_name = try buf.toOwnedSlice();
+    errdefer allocator.free(field_name);
+    const node = try allocator.create(Expr);
+    node.* = .{ .field = field_name };
+    return node;
 }
 
 // ---- WHERE BOOLEAN TREE PARSER ---------------------------------------------
@@ -560,30 +643,28 @@ fn parseWherePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token)
         cur.* = cur_save;
         cur.* = try tok.next();
         const inner = try parseWhereOr(allocator, tok, cur);
-        if (cur.tag != .rparen) {
-            inner.deinit(allocator);
-            return error.UnexpectedToken;
-        }
+        errdefer inner.deinit(allocator);
+        if (cur.tag != .rparen) return error.UnexpectedToken;
         cur.* = try tok.next();
         return inner;
     }
 
     // Single condition leaf.
-    var lhs_expr_opt: ?*Expr = null;
-    var key: []const u8 = undefined;
-
     if (cur.tag == .kw_has) {
         cur.* = try tok.next();
         const negate = cur.tag == .kw_not;
         if (negate) cur.* = try tok.next();
         if (cur.tag != .lparen) return error.UnexpectedToken;
         cur.* = try tok.next();
-        key = try parseGlobKey(allocator, tok, cur);
+        const key = try parseGlobKey(allocator, tok, cur);
         if (cur.tag != .rparen) {
             allocator.free(key);
             return error.UnexpectedToken;
         }
-        cur.* = try tok.next();
+        cur.* = tok.next() catch |e| {
+            allocator.free(key);
+            return e;
+        };
         return WhereClause{ .leaf = .{ .key = key, .op = if (negate) .not_has_key else .has_key, .value = .null_val, .lhs_expr = null } };
     }
 
@@ -595,12 +676,15 @@ fn parseWherePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token)
             cur.* = try tok.next(); // consume 'has'
             if (cur.tag != .lparen) return error.UnexpectedToken;
             cur.* = try tok.next();
-            key = try parseGlobKey(allocator, tok, cur);
+            const key = try parseGlobKey(allocator, tok, cur);
             if (cur.tag != .rparen) {
                 allocator.free(key);
                 return error.UnexpectedToken;
             }
-            cur.* = try tok.next();
+            cur.* = tok.next() catch |e| {
+                allocator.free(key);
+                return e;
+            };
             return WhereClause{ .leaf = .{ .key = key, .op = .not_has_key, .value = .null_val, .lhs_expr = null } };
         }
         if (peek_tok.tag == .lparen) {
@@ -608,10 +692,8 @@ fn parseWherePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token)
             cur.* = try tok.next(); // consume 'not'
             cur.* = try tok.next(); // consume '('
             const inner = try parseWhereOr(allocator, tok, cur);
-            if (cur.tag != .rparen) {
-                inner.deinit(allocator);
-                return error.UnexpectedToken;
-            }
+            errdefer inner.deinit(allocator);
+            if (cur.tag != .rparen) return error.UnexpectedToken;
             cur.* = try tok.next();
             const inner_ptr = try allocator.create(WhereClause);
             inner_ptr.* = inner;
@@ -620,50 +702,40 @@ fn parseWherePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token)
         // fall through — NOT IN / NOT CONTAINS / NOT MATCHES handled in parseConditionBody
     }
 
-    // Function keyword: only route to parseExpr when followed by '(' (actual call).
-    // Otherwise treat as a plain field name — e.g. `where keys = "x"` or `where len = 5`.
-    if (isFuncKeyword(cur.tag) != null) {
+    // A call (`len(name) > 5`, `ifhas(...)`) is a computed LHS. A function
+    // keyword not followed by '(' is a plain field name (`where keys = "x"`).
+    if (isFuncKeyword(cur.tag) != null or cur.tag == .ident) {
         var tok_peek = tok.*;
         const peek = tok_peek.next() catch return error.UnexpectedToken;
         if (peek.tag == .lparen) {
-            const expr_node = try parseExpr(allocator, tok, cur);
-            lhs_expr_opt = expr_node;
-            key = try allocator.dupe(u8, "__expr__");
-        } else {
-            key = try parseGlobKey(allocator, tok, cur);
-        }
-    } else {
-        key = try parseGlobKey(allocator, tok, cur);
-    }
-
-    // If a // follows the key, convert to a coalesce expression LHS.
-    // e.g. `where score // 0 > 50`  or  `where name // "unknown" = "Alice"`
-    if (cur.tag == .op_alt and lhs_expr_opt == null) {
-        // Wrap the bare key as a .field Expr, then parse the // chain via parseExpr.
-        const field_node = try allocator.create(Expr);
-        field_node.* = .{ .field = key }; // key ownership transferred into Expr
-        var lhs_e: *Expr = field_node;
-        while (cur.tag == .op_alt) {
-            cur.* = try tok.next();
-            const rhs_e = try parseAdd(allocator, tok, cur);
-            const args = allocator.alloc(*Expr, 2) catch {
-                rhs_e.deinit(allocator);
-                allocator.destroy(rhs_e);
-                lhs_e.deinit(allocator);
-                allocator.destroy(lhs_e);
+            const e = try parseExpr(allocator, tok, cur);
+            const k = allocator.dupe(u8, "__expr__") catch {
+                destroyExpr(allocator, e);
                 return error.OutOfMemory;
             };
-            args[0] = lhs_e;
-            args[1] = rhs_e;
-            const coalesce_node = try allocator.create(Expr);
-            coalesce_node.* = .{ .func = .{ .name = .coalesce, .args = args } };
-            lhs_e = coalesce_node;
+            return parseConditionBody(allocator, tok, cur, k, e);
         }
-        lhs_expr_opt = lhs_e;
-        key = try allocator.dupe(u8, "__expr__");
     }
 
-    return parseConditionBody(allocator, tok, cur, key, lhs_expr_opt);
+    const key = try parseGlobKey(allocator, tok, cur);
+
+    // Arithmetic after the field makes it a computed LHS:
+    // `where price * qty > 100`, `where score // 0 > 50`.
+    if (isArithOp(cur.*)) {
+        const field_node = allocator.create(Expr) catch {
+            allocator.free(key);
+            return error.OutOfMemory;
+        };
+        field_node.* = .{ .field = key }; // key ownership transferred into Expr
+        const e = try parseExprFrom(allocator, tok, cur, field_node);
+        const k = allocator.dupe(u8, "__expr__") catch {
+            destroyExpr(allocator, e);
+            return error.OutOfMemory;
+        };
+        return parseConditionBody(allocator, tok, cur, k, e);
+    }
+
+    return parseConditionBody(allocator, tok, cur, key, null);
 }
 
 fn parseWhereAnd(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!WhereClause {
@@ -856,569 +928,400 @@ fn resolveWhereAliases(
     }
 }
 
+/// Parse a query. Keywords are case-insensitive; field names are not.
+/// After the optional scope, GROUP BY may precede SELECT; the remaining
+/// clauses (WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, INTO) may come in any
+/// order, each at most once. Anything left unparsed is an error — a query is
+/// never silently truncated.
 pub fn parse(allocator: std.mem.Allocator, src: []const u8, fail_pos: ?*usize) ParseError!Query {
     var tok = Tokenizer{ .src = src };
-    // On any parse error, record the tokenizer's current position for diagnostics.
+    // On any parse error, record where it happened for diagnostics.
     errdefer if (fail_pos) |fp| {
-        fp.* = tok.pos;
+        fp.* = tok.err_pos orelse tok.pos;
     };
+    var q = Query{
+        .scope_pattern = null,
+        .fields = null,
+        .where = null,
+        .order_by = null,
+        .limit = null,
+        .group_by = null,
+        .has_count = false,
+    };
+    errdefer q.deinit(allocator);
     var cur = try tok.next();
-
-    var scope_pattern: ?[]const u8 = null;
-    var fields: ?[]SelectField = null;
-    var where: ?WhereClause = null;
 
     // SCOPE [pattern]
     if (cur.tag == .lbracket) {
         cur = try tok.next();
-        const pat = try parseGlobKey(allocator, &tok, &cur);
-        errdefer allocator.free(pat);
+        q.scope_pattern = try parseGlobKey(allocator, &tok, &cur);
         if (cur.tag != .rbracket) return error.UnexpectedToken;
         cur = try tok.next();
-        scope_pattern = pat;
     }
 
-    // GROUP BY (may appear before or after SELECT — both orders are accepted)
-    var group_by: ?[]GroupByKey = null;
-    if (cur.tag == .kw_group) {
-        group_by = try parseGroupByClause(allocator, &tok, &cur, fields);
-    }
+    // GROUP BY before SELECT (no SELECT aliases to resolve yet)
+    if (cur.tag == .kw_group) q.group_by = try parseGroupByClause(allocator, &tok, &cur, null);
 
-    // SELECT [DISTINCT]
-    var has_count = false;
-    var is_distinct = false;
-    var global_agg = false;
     if (cur.tag == .kw_select) {
         cur = try tok.next();
-        // Optional DISTINCT after SELECT
-        if (cur.tag == .kw_distinct) {
-            is_distinct = true;
-            cur = try tok.next();
+        try parseSelectList(allocator, &tok, &cur, &q);
+    }
+
+    while (cur.tag != .eof) {
+        const repeated = switch (cur.tag) {
+            .kw_where => q.where != null,
+            .kw_group => q.group_by != null,
+            .kw_having => q.having != null,
+            .kw_order => q.order_by != null,
+            .kw_limit => q.limit != null,
+            .kw_into => q.into != null,
+            else => true, // not a clause keyword: unparsed trailing input
+        };
+        if (repeated) {
+            tok.err_pos = cur.start;
+            return error.UnexpectedToken;
         }
-        var list = std.array_list.Managed(SelectField).init(allocator);
-        errdefer {
-            for (list.items) |f| {
-                allocator.free(f.key);
-                if (f.alias) |a| allocator.free(a);
-            }
-            list.deinit();
-        }
-        while (true) {
-            // count() or count — treated as aggregate, not a real field
-            if (cur.tag == .kw_count) {
-                has_count = true;
+        switch (cur.tag) {
+            .kw_where => {
                 cur = try tok.next();
-                // consume optional ()
-                if (cur.tag == .lparen) {
-                    cur = try tok.next(); // expect rparen
-                    if (cur.tag == .rparen) cur = try tok.next();
-                }
-                // handle alias: count as total
-                var count_alias: ?[]const u8 = null;
-                if (cur.tag == .kw_as) {
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    count_alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                }
-                const count_key = try allocator.dupe(u8, "count");
-                try list.append(.{ .key = count_key, .alias = count_alias });
-                if (cur.tag == .comma) {
-                    cur = try tok.next();
-                } else break;
-                continue;
-            }
-            // sum(field), avg(field), min(field), max(field) — group-by aggregates
-            const agg_func: ?AggFunc = switch (cur.tag) {
-                .kw_sum => AggFunc.sum,
-                .kw_avg => AggFunc.avg,
-                .kw_min => AggFunc.min,
-                .kw_max => AggFunc.max,
-                .kw_stddev => AggFunc.stddev,
-                .kw_variance => AggFunc.variance,
-                else => null,
-            };
-            if (agg_func) |af| {
-                const agg_tag_text = cur.text; // e.g. "sum"
+                q.where = try parseWhereOr(allocator, &tok, &cur);
+            },
+            .kw_group => q.group_by = try parseGroupByClause(allocator, &tok, &cur, q.fields),
+            // HAVING filters groups after aggregation, on output column names.
+            .kw_having => {
                 cur = try tok.next();
-                if (cur.tag != .lparen) return error.UnexpectedToken;
+                q.having = try parseWhereOr(allocator, &tok, &cur);
+            },
+            .kw_order => q.order_by = try parseOrderBy(allocator, &tok, &cur, q.fields),
+            .kw_limit => {
                 cur = try tok.next();
-                const agg_field = try parseGlobKey(allocator, &tok, &cur);
-                errdefer allocator.free(agg_field);
-                if (cur.tag != .rparen) return error.UnexpectedToken;
+                if (cur.tag != .number) return error.UnexpectedToken;
+                q.limit = std.fmt.parseInt(usize, cur.text, 10) catch return error.UnexpectedToken;
                 cur = try tok.next();
-                // optional alias
-                var agg_alias: ?[]const u8 = null;
-                if (cur.tag == .kw_as) {
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    agg_alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                } else {
-                    // default alias: "sum", "avg", "min", "max"
-                    agg_alias = try allocator.dupe(u8, agg_tag_text);
-                }
-                try list.append(.{ .key = agg_field, .alias = agg_alias, .agg = af });
-                if (cur.tag == .comma) {
-                    cur = try tok.next();
-                } else break;
-                continue;
-            }
-            // EXPAND(field) — unnest an array field into multiple output rows
-            // Also handles expand(split(field, delim)) — split then expand
-            if (cur.tag == .kw_expand) {
-                cur = try tok.next();
-                if (cur.tag != .lparen) return error.UnexpectedToken;
-                cur = try tok.next();
-                var exp_split_delim: ?[]const u8 = null;
-                const in_split = cur.tag == .kw_split;
-                if (in_split) {
-                    // expand(split(field, "delim")) — parse the inner split call
-                    cur = try tok.next();
-                    if (cur.tag != .lparen) return error.UnexpectedToken;
-                    cur = try tok.next();
-                }
-                const exp_field = try parseGlobKey(allocator, &tok, &cur);
-                errdefer allocator.free(exp_field);
-                if (in_split) {
-                    // Expect: , "delim" )  (closing split) then ) closing expand
-                    if (cur.tag != .comma) return error.UnexpectedToken;
-                    cur = try tok.next();
-                    if (cur.tag != .string) return error.UnexpectedToken;
-                    exp_split_delim = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                    if (cur.tag != .rparen) return error.UnexpectedToken; // close split(
-                    cur = try tok.next();
-                }
-                if (cur.tag != .rparen) return error.UnexpectedToken; // close expand(
-                cur = try tok.next();
-                var exp_alias: ?[]const u8 = null;
-                if (cur.tag == .kw_as) {
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    exp_alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                }
-                try list.append(.{ .key = exp_field, .alias = exp_alias, .is_expand = true, .expand_split_delim = exp_split_delim });
-                if (cur.tag == .comma) {
-                    cur = try tok.next();
-                } else break;
-                continue;
-            }
-            // CASE WHEN expression column — starts with `case` keyword
-            if (cur.tag == .kw_case) {
-                const expr_node = try parsePrimary(allocator, &tok, &cur);
-                errdefer {
-                    expr_node.deinit(allocator);
-                    allocator.destroy(expr_node);
-                }
-                if (cur.tag != .kw_as) return error.UnexpectedToken;
-                cur = try tok.next();
-                if (cur.tag != .ident) return error.UnexpectedToken;
-                const case_alias = try allocator.dupe(u8, cur.text);
-                cur = try tok.next();
-                const dummy_key = try allocator.dupe(u8, case_alias);
-                try list.append(.{ .key = dummy_key, .alias = case_alias, .expr = expr_node });
-                if (cur.tag == .comma) {
-                    cur = try tok.next();
-                } else break;
-                continue;
-            }
-            const key = try parseGlobKey(allocator, &tok, &cur);
-            errdefer allocator.free(key);
-            var alias: ?[]const u8 = null;
-            const default_val: ?[]const u8 = null;
-            // isnull(field, "default") — parsed after the key if next token is lparen
-            // Alternatively spelled as bare key then checked below.
-            // We also detect: isnull was the keyword itself before parseGlobKey ate it.
-            // Since "isnull" is in identLike, parseGlobKey returns "isnull" as the key.
-            // Detect pattern: key == "isnull" followed by '('
-            if (std.mem.eql(u8, key, "isnull") and cur.tag == .lparen) {
-                allocator.free(key); // discard the "isnull" key string
-                cur = try tok.next(); // the actual field key
-                const real_key = try parseGlobKey(allocator, &tok, &cur);
-                errdefer allocator.free(real_key);
-                if (cur.tag != .comma) return error.UnexpectedToken;
+            },
+            // INTO 'path' — output destination file
+            .kw_into => {
                 cur = try tok.next();
                 if (cur.tag != .string) return error.UnexpectedToken;
-                const def = try allocator.dupe(u8, cur.text);
-                errdefer allocator.free(def);
+                q.into = try allocator.dupe(u8, cur.text);
                 cur = try tok.next();
-                if (cur.tag != .rparen) return error.UnexpectedToken;
-                cur = try tok.next();
-                // optional alias
-                if (cur.tag == .kw_as) {
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                }
-                try list.append(.{ .key = real_key, .alias = alias, .default_val = def });
-            } else if (funcNameFromStr(key) != null and cur.tag == .lparen) {
-                // Function call column: upper(name) as alias
-                // Re-parse: put cur back to lparen and parse a func call expression.
-                // We already consumed the func keyword as a string key — reconstruct
-                // by backing the tokenizer to parse the lparen (it's already in cur).
-                const fn_name = funcNameFromStr(key).?;
-                allocator.free(key); // drop the string key
-                // cur is now .lparen — parse args
-                cur = try tok.next(); // consume '('
-                var args = std.array_list.Managed(*Expr).init(allocator);
-                errdefer {
-                    for (args.items) |a| {
-                        a.deinit(allocator);
-                        allocator.destroy(a);
-                    }
-                    args.deinit();
-                }
-                while (cur.tag != .rparen and cur.tag != .eof) {
-                    const arg = try parseExpr(allocator, &tok, &cur);
-                    try args.append(arg);
-                    if (cur.tag == .comma) cur = try tok.next();
-                }
-                if (cur.tag != .rparen) return error.UnexpectedToken;
-                cur = try tok.next();
-                const func_node = try allocator.create(Expr);
-                func_node.* = .{ .func = .{ .name = fn_name, .args = try args.toOwnedSlice() } };
-                // optional arithmetic on the result: upper(name) is complete, check for + * etc.
-                const expr_node: *Expr = func_node;
-                // (for simplicity, function result arithmetic is not supported at this level;
-                //  users can wrap: this is a rare case)
-                // must have alias
-                if (cur.tag != .kw_as) return error.UnexpectedToken;
-                cur = try tok.next();
-                if (cur.tag != .ident) return error.UnexpectedToken;
-                alias = try allocator.dupe(u8, cur.text);
-                cur = try tok.next();
-                const dummy_key = try allocator.dupe(u8, alias.?);
-                try list.append(.{ .key = dummy_key, .alias = alias, .expr = expr_node });
-            } else if (cur.tag == .op_plus or cur.tag == .op_minus or
-                cur.tag == .star or cur.tag == .op_div or cur.tag == .op_mod or
-                cur.tag == .op_alt)
-            {
-                // Computed expression: `price * qty as total`
-                // Re-parse from the key as an Expr, then parse the RHS arithmetic.
-                // We already consumed the key via parseGlobKey — rebuild as Expr field node.
-                const lhs_field = try allocator.create(Expr);
-                lhs_field.* = .{ .field = key }; // key ownership transferred to Expr
-                errdefer {
-                    lhs_field.deinit(allocator);
-                    allocator.destroy(lhs_field);
-                }
-                // Finish the rest of the expression: we have lhs_field, now parse the binary op.
-                // Use parseMul/parseAdd sub-parsers with &cur (cur is Token var in this scope)
-                var lhs: *Expr = lhs_field;
-                // mul-level: consume * / % right-binding to lhs_field
-                while (cur.tag == .star or cur.tag == .op_div or cur.tag == .op_mod) {
-                    const op2 = cur.tag;
-                    cur = try tok.next();
-                    const rhs2 = try parsePrimary(allocator, &tok, &cur);
-                    const node2 = try allocator.create(Expr);
-                    const bin2 = BinExpr{ .lhs = lhs, .rhs = rhs2 };
-                    node2.* = switch (op2) {
-                        .star => .{ .mul = bin2 },
-                        .op_div => .{ .div = bin2 },
-                        .op_mod => .{ .mod = bin2 },
-                        else => unreachable,
-                    };
-                    lhs = node2;
-                }
-                // add-level: consume + - with proper mul-level rhs
-                while (cur.tag == .op_plus or cur.tag == .op_minus) {
-                    const op2 = cur.tag;
-                    cur = try tok.next();
-                    var rhs2 = try parsePrimary(allocator, &tok, &cur);
-                    while (cur.tag == .star or cur.tag == .op_div or cur.tag == .op_mod) {
-                        const op3 = cur.tag;
-                        cur = try tok.next();
-                        const rhs3 = try parsePrimary(allocator, &tok, &cur);
-                        const node3 = try allocator.create(Expr);
-                        const bin3 = BinExpr{ .lhs = rhs2, .rhs = rhs3 };
-                        node3.* = switch (op3) {
-                            .star => .{ .mul = bin3 },
-                            .op_div => .{ .div = bin3 },
-                            .op_mod => .{ .mod = bin3 },
-                            else => unreachable,
-                        };
-                        rhs2 = node3;
-                    }
-                    const node2 = try allocator.create(Expr);
-                    const bin2 = BinExpr{ .lhs = lhs, .rhs = rhs2 };
-                    node2.* = if (op2 == .op_plus) .{ .add = bin2 } else .{ .sub = bin2 };
-                    lhs = node2;
-                }
-                // // (alternative/coalesce): score // 0 as alias
-                while (cur.tag == .op_alt) {
-                    cur = try tok.next();
-                    const rhs_alt = try parseAdd(allocator, &tok, &cur);
-                    const alt_args = allocator.alloc(*Expr, 2) catch {
-                        rhs_alt.deinit(allocator);
-                        allocator.destroy(rhs_alt);
-                        return error.OutOfMemory;
-                    };
-                    alt_args[0] = lhs;
-                    alt_args[1] = rhs_alt;
-                    const coalesce_node = try allocator.create(Expr);
-                    coalesce_node.* = .{ .func = .{ .name = .coalesce, .args = alt_args } };
-                    lhs = coalesce_node;
-                }
-                // must have alias for computed column
-                if (cur.tag != .kw_as) return error.UnexpectedToken;
-                cur = try tok.next();
-                if (cur.tag != .ident) return error.UnexpectedToken;
-                alias = try allocator.dupe(u8, cur.text);
-                cur = try tok.next();
-                const dummy_key = try allocator.dupe(u8, alias.?);
-                try list.append(.{ .key = dummy_key, .alias = alias, .expr = lhs });
-            } else {
-                // Plain field — check for // (alternative) before treating as bare key
-                if (cur.tag == .op_alt) {
-                    const field_node = try allocator.create(Expr);
-                    field_node.* = .{ .field = key }; // key ownership into Expr
-                    var lhs_plain: *Expr = field_node;
-                    while (cur.tag == .op_alt) {
-                        cur = try tok.next();
-                        const rhs_a = try parseAdd(allocator, &tok, &cur);
-                        const alt_args2 = allocator.alloc(*Expr, 2) catch {
-                            rhs_a.deinit(allocator);
-                            allocator.destroy(rhs_a);
-                            return error.OutOfMemory;
-                        };
-                        alt_args2[0] = lhs_plain;
-                        alt_args2[1] = rhs_a;
-                        const cn = try allocator.create(Expr);
-                        cn.* = .{ .func = .{ .name = .coalesce, .args = alt_args2 } };
-                        lhs_plain = cn;
-                    }
-                    if (cur.tag != .kw_as) return error.UnexpectedToken;
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                    const dummy_key2 = try allocator.dupe(u8, alias.?);
-                    try list.append(.{ .key = dummy_key2, .alias = alias, .expr = lhs_plain });
-                } else {
-                    if (cur.tag == .kw_as) {
-                        cur = try tok.next();
-                        if (cur.tag != .ident) return error.UnexpectedToken;
-                        alias = try allocator.dupe(u8, cur.text);
-                        cur = try tok.next();
-                    }
-                    try list.append(.{ .key = key, .alias = alias, .default_val = default_val });
-                }
-            }
-            if (cur.tag == .comma) {
-                cur = try tok.next();
-            } else break;
+            },
+            else => unreachable,
         }
-        // After the base field list: handle SELECT * ADD expr AS col, REMOVE col1, col2
-        // The `*` was already parsed as a SelectField with key=="*".
-        // Now check for ADD / REMOVE modifiers (only valid when `*` is in the list).
-        while (cur.tag == .kw_add or cur.tag == .kw_remove) {
-            if (cur.tag == .kw_add) {
-                cur = try tok.next();
-                // Parse expression (may be arithmetic / func call / CASE)
-                if (cur.tag == .kw_case) {
-                    const expr_node = try parsePrimary(allocator, &tok, &cur);
-                    errdefer {
-                        expr_node.deinit(allocator);
-                        allocator.destroy(expr_node);
-                    }
-                    if (cur.tag != .kw_as) return error.UnexpectedToken;
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    const add_alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                    const add_key = try allocator.dupe(u8, add_alias);
-                    try list.append(.{ .key = add_key, .alias = add_alias, .expr = expr_node, .is_add = true });
-                } else if (isFuncKeyword(cur.tag) != null) {
-                    const expr_node = try parseExpr(allocator, &tok, &cur);
-                    errdefer {
-                        expr_node.deinit(allocator);
-                        allocator.destroy(expr_node);
-                    }
-                    if (cur.tag != .kw_as) return error.UnexpectedToken;
-                    cur = try tok.next();
-                    if (cur.tag != .ident) return error.UnexpectedToken;
-                    const add_alias = try allocator.dupe(u8, cur.text);
-                    cur = try tok.next();
-                    const add_key = try allocator.dupe(u8, add_alias);
-                    try list.append(.{ .key = add_key, .alias = add_alias, .expr = expr_node, .is_add = true });
-                } else {
-                    const add_key_str = try parseGlobKey(allocator, &tok, &cur);
-                    errdefer allocator.free(add_key_str);
-                    // Check for arithmetic expression continuation
-                    if (cur.tag == .op_plus or cur.tag == .op_minus or cur.tag == .star or cur.tag == .op_div or cur.tag == .op_mod) {
-                        var lhs_add = try allocator.create(Expr);
-                        lhs_add.* = .{ .field = add_key_str };
-                        errdefer {
-                            lhs_add.deinit(allocator);
-                            allocator.destroy(lhs_add);
-                        }
-                        while (cur.tag == .star or cur.tag == .op_div or cur.tag == .op_mod) {
-                            const op2 = cur.tag;
-                            cur = try tok.next();
-                            const rhs2 = try parsePrimary(allocator, &tok, &cur);
-                            const nd2 = try allocator.create(Expr);
-                            nd2.* = switch (op2) {
-                                .star => .{ .mul = .{ .lhs = lhs_add, .rhs = rhs2 } },
-                                .op_div => .{ .div = .{ .lhs = lhs_add, .rhs = rhs2 } },
-                                .op_mod => .{ .mod = .{ .lhs = lhs_add, .rhs = rhs2 } },
-                                else => unreachable,
-                            };
-                            lhs_add = nd2;
-                        }
-                        while (cur.tag == .op_plus or cur.tag == .op_minus) {
-                            const op2 = cur.tag;
-                            cur = try tok.next();
-                            const rhs2 = try parsePrimary(allocator, &tok, &cur);
-                            const nd2 = try allocator.create(Expr);
-                            nd2.* = if (op2 == .op_plus) .{ .add = .{ .lhs = lhs_add, .rhs = rhs2 } } else .{ .sub = .{ .lhs = lhs_add, .rhs = rhs2 } };
-                            lhs_add = nd2;
-                        }
-                        if (cur.tag != .kw_as) return error.UnexpectedToken;
-                        cur = try tok.next();
-                        if (cur.tag != .ident) return error.UnexpectedToken;
-                        const add_alias = try allocator.dupe(u8, cur.text);
-                        cur = try tok.next();
-                        const add_key2 = try allocator.dupe(u8, add_alias);
-                        try list.append(.{ .key = add_key2, .alias = add_alias, .expr = lhs_add, .is_add = true });
-                    } else {
-                        // plain field add (rename-style)
-                        var add_alias: ?[]const u8 = null;
-                        if (cur.tag == .kw_as) {
-                            cur = try tok.next();
-                            if (cur.tag != .ident) return error.UnexpectedToken;
-                            add_alias = try allocator.dupe(u8, cur.text);
-                            cur = try tok.next();
-                        }
-                        try list.append(.{ .key = add_key_str, .alias = add_alias, .is_add = true });
-                    }
-                }
-            } else { // kw_remove
-                cur = try tok.next();
-                // consume comma-separated field names to remove
-                while (true) {
-                    const rem_key = try parseGlobKey(allocator, &tok, &cur);
-                    try list.append(.{ .key = rem_key, .alias = null, .is_remove = true });
-                    if (cur.tag == .comma) {
-                        cur = try tok.next();
-                    } else break;
-                    // stop if next token is a query keyword
-                    if (cur.tag == .kw_where or cur.tag == .kw_group or cur.tag == .kw_order or
-                        cur.tag == .kw_limit or cur.tag == .kw_add or cur.tag == .kw_remove or
-                        cur.tag == .kw_having) break;
-                }
-            }
-        }
-        // Detect global aggregates: agg fields present but no group_by will be set.
-        // We mark global_agg now so the executor knows.
-        for (list.items) |f| {
-            if (f.agg != null) {
-                global_agg = true;
-                break;
-            }
-        }
-        if (has_count) global_agg = true;
-        fields = try list.toOwnedSlice();
     }
 
-    // WHERE
-    if (cur.tag == .kw_where) {
-        cur = try tok.next();
-        where = try parseWhereOr(allocator, &tok, &cur);
+    // Aggregates without GROUP BY aggregate over the whole input.
+    if (q.group_by == null) {
+        q.global_agg = q.has_count;
+        if (q.fields) |flds| for (flds) |f| {
+            if (f.agg != null) q.global_agg = true;
+        };
     }
-
-    // GROUP BY (if not already parsed before SELECT)
-    if (group_by == null and cur.tag == .kw_group) {
-        group_by = try parseGroupByClause(allocator, &tok, &cur, fields);
-    }
-
-    // WHERE (also accepted after GROUP BY — clause order is flexible)
-    if (where == null and cur.tag == .kw_where) {
-        cur = try tok.next();
-        where = try parseWhereOr(allocator, &tok, &cur);
-    }
-
-    // ORDER BY (supports aliases and 1-based ordinal positions)
-    var order_by: ?[]OrderField = null;
-    if (cur.tag == .kw_order) {
-        cur = try tok.next();
-        if (cur.tag != .kw_by) return error.UnexpectedToken;
-        cur = try tok.next();
-        var ob_list = std.array_list.Managed(OrderField).init(allocator);
-        errdefer {
-            for (ob_list.items) |f| allocator.free(f.key);
-            ob_list.deinit();
-        }
-        while (true) {
-            // Ordinal: ORDER BY 1, 2 — resolve to the nth SELECT field key/alias
-            const key: []const u8 = if (cur.tag == .number) blk: {
-                const ord = std.fmt.parseInt(usize, cur.text, 10) catch return error.UnexpectedToken;
-                cur = try tok.next();
-                // Resolve ordinal to field name
-                if (fields != null and ord >= 1 and ord <= fields.?.len) {
-                    const sf = fields.?[ord - 1];
-                    break :blk try allocator.dupe(u8, if (sf.alias) |a| a else sf.key);
-                }
-                break :blk try std.fmt.allocPrint(allocator, "{d}", .{ord});
-            } else blk: {
-                const raw_key = try parseGlobKey(allocator, &tok, &cur);
-                // Alias resolution: if raw_key matches an alias in SELECT, use that alias
-                // directly (the projected record will have that key).
-                break :blk raw_key;
-            };
-            errdefer allocator.free(key);
-            var dir: SortDir = .asc;
-            if (cur.tag == .kw_asc) {
-                cur = try tok.next();
-            } else if (cur.tag == .kw_desc) {
-                dir = .desc;
-                cur = try tok.next();
-            }
-            try ob_list.append(.{ .key = key, .dir = dir });
-            if (cur.tag == .comma) {
-                cur = try tok.next();
-            } else break;
-        }
-        order_by = try ob_list.toOwnedSlice();
-    }
-
-    // HAVING — post-GROUP BY filter on aggregated results
-    var having: ?WhereClause = null;
-    if (cur.tag == .kw_having) {
-        cur = try tok.next();
-        having = try parseWhereOr(allocator, &tok, &cur);
-    }
-
-    // LIMIT
-    var limit: ?usize = null;
-    if (cur.tag == .kw_limit) {
-        cur = try tok.next();
-        if (cur.tag != .number) return error.UnexpectedToken;
-        limit = std.fmt.parseInt(usize, cur.text, 10) catch return error.UnexpectedToken;
-        cur = try tok.next();
-    }
-
-    // INTO 'path'
-    var into: ?[]const u8 = null;
-    if (cur.tag == .kw_into) {
-        cur = try tok.next();
-        if (cur.tag != .string) return error.UnexpectedToken;
-        into = try allocator.dupe(u8, cur.text);
-        cur = try tok.next();
-    }
-
-    // If group_by is set, aggregates are not "global" — they are per-group.
-    if (group_by != null) global_agg = false;
 
     // Resolve SELECT aliases referenced in WHERE (e.g. `select dept as d where d = "x"`).
     // Skipped for HAVING, which intentionally references output column names.
-    if (fields) |flds| {
-        if (where) |*w| try resolveWhereAliases(allocator, w, flds);
+    if (q.fields) |flds| {
+        if (q.where) |*w| try resolveWhereAliases(allocator, w, flds);
+    }
+    return q;
+}
+
+/// `as <name>`: `cur` is just past `as`. A keyword (`as count`) or a quoted
+/// string (`as "total amount"`) may serve as the name.
+fn parseAlias(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError![]const u8 {
+    if (cur.tag == .number or (cur.tag != .string and !isKeywordIdent(cur.tag))) return error.UnexpectedToken;
+    const alias = try allocator.dupe(u8, cur.text);
+    errdefer allocator.free(alias);
+    cur.* = try tok.next();
+    return alias;
+}
+
+/// Optional `as <name>`.
+fn parseOptAlias(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!?[]const u8 {
+    if (cur.tag != .kw_as) return null;
+    cur.* = try tok.next();
+    return try parseAlias(allocator, tok, cur);
+}
+
+/// Mandatory `as <name>` (computed columns need a name).
+fn parseReqAlias(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError![]const u8 {
+    return try parseOptAlias(allocator, tok, cur) orelse error.UnexpectedToken;
+}
+
+/// The argument of an aggregate, `cur` just past '('. A bare field path
+/// (`sum(a.b)`, including keyword names like `sum(count)`) becomes the
+/// field's key; anything else (`sum(price * qty)`) is kept as an expression,
+/// with a synthetic key. The closing ')' is consumed.
+const AggArg = struct { key: []const u8, expr: ?*Expr };
+
+fn parseAggArg(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!AggArg {
+    const tok_save = tok.*;
+    const cur_save = cur.*;
+    if (isKeywordIdent(cur.tag) and cur.tag != .number) {
+        if (parseGlobKey(allocator, tok, cur)) |key| {
+            if (cur.tag == .rparen) {
+                cur.* = tok.next() catch |e| {
+                    allocator.free(key);
+                    return e;
+                };
+                return .{ .key = key, .expr = null };
+            }
+            allocator.free(key);
+        } else |_| {}
+        tok.* = tok_save;
+        cur.* = cur_save;
+    }
+    const e = try parseExpr(allocator, tok, cur);
+    errdefer destroyExpr(allocator, e);
+    if (cur.tag != .rparen) return error.UnexpectedToken;
+    cur.* = try tok.next();
+    return .{ .key = try allocator.dupe(u8, "__agg_expr__"), .expr = e };
+}
+
+fn aggFuncOf(tag: TokTag) ?AggFunc {
+    return switch (tag) {
+        .kw_sum => .sum,
+        .kw_avg => .avg,
+        .kw_min => .min,
+        .kw_max => .max,
+        .kw_stddev => .stddev,
+        .kw_variance => .variance,
+        else => null,
+    };
+}
+
+/// Parse the SELECT list into `q.fields` (cur is just past `select`).
+fn parseSelectList(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, q: *Query) ParseError!void {
+    // Optional DISTINCT after SELECT
+    if (cur.tag == .kw_distinct) {
+        q.distinct = true;
+        cur.* = try tok.next();
+    }
+    var list = std.array_list.Managed(SelectField).init(allocator);
+    errdefer {
+        for (list.items) |f| f.deinit(allocator);
+        list.deinit();
+    }
+    while (true) {
+        const f = try parseSelectItem(allocator, tok, cur, &q.has_count, false);
+        list.append(f) catch {
+            f.deinit(allocator);
+            return error.OutOfMemory;
+        };
+        if (cur.tag != .comma) break;
+        cur.* = try tok.next();
+    }
+    // SELECT * ADD expr AS col / SELECT * REMOVE col1, col2
+    while (cur.tag == .kw_add or cur.tag == .kw_remove) {
+        const is_add = cur.tag == .kw_add;
+        cur.* = try tok.next();
+        if (is_add) {
+            const f = try parseSelectItem(allocator, tok, cur, &q.has_count, true);
+            list.append(f) catch {
+                f.deinit(allocator);
+                return error.OutOfMemory;
+            };
+            continue;
+        }
+        while (true) {
+            const rem_key = try parseGlobKey(allocator, tok, cur);
+            list.append(.{ .key = rem_key, .alias = null, .is_remove = true }) catch {
+                allocator.free(rem_key);
+                return error.OutOfMemory;
+            };
+            if (cur.tag != .comma) break;
+            cur.* = try tok.next();
+        }
+    }
+    q.fields = try list.toOwnedSlice();
+}
+
+/// One SELECT item (or the operand of `* add`, when `is_add`).
+fn parseSelectItem(
+    allocator: std.mem.Allocator,
+    tok: *Tokenizer,
+    cur: *Token,
+    has_count: *bool,
+    is_add: bool,
+) ParseError!SelectField {
+    // count / count() / count(*): rows; count(expr): non-null values of expr
+    if (cur.tag == .kw_count and !is_add) {
+        cur.* = try tok.next();
+        var arg: ?AggArg = null;
+        if (cur.tag == .lparen) {
+            cur.* = try tok.next();
+            if (cur.tag == .star or cur.tag == .rparen) {
+                if (cur.tag == .star) cur.* = try tok.next();
+                if (cur.tag != .rparen) return error.UnexpectedToken;
+                cur.* = try tok.next();
+            } else {
+                arg = try parseAggArg(allocator, tok, cur);
+            }
+        }
+        if (arg) |a| {
+            errdefer {
+                allocator.free(a.key);
+                if (a.expr) |e| destroyExpr(allocator, e);
+            }
+            const alias = try parseOptAlias(allocator, tok, cur) orelse try allocator.dupe(u8, "count");
+            return .{ .key = a.key, .alias = alias, .agg = .count, .expr = a.expr };
+        }
+        has_count.* = true;
+        const alias = try parseOptAlias(allocator, tok, cur);
+        errdefer if (alias) |a| allocator.free(a);
+        return .{ .key = try allocator.dupe(u8, "count"), .alias = alias, .agg = .count_rows };
     }
 
-    return .{ .scope_pattern = scope_pattern, .fields = fields, .where = where, .having = having, .order_by = order_by, .limit = limit, .group_by = group_by, .has_count = has_count, .global_agg = global_agg, .distinct = is_distinct, .into = into };
+    // sum(..), avg(..), min(..), max(..), stddev(..), variance(..)
+    if (aggFuncOf(cur.tag)) |af| agg: {
+        if (is_add) break :agg;
+        var peek_tok = tok.*;
+        if ((try peek_tok.next()).tag == .lparen) {
+            cur.* = try tok.next(); // the '('
+            cur.* = try tok.next();
+            const a = try parseAggArg(allocator, tok, cur);
+            errdefer {
+                allocator.free(a.key);
+                if (a.expr) |e| destroyExpr(allocator, e);
+            }
+            // default output name: "sum", "avg", ... (lowercase, whatever the query's case)
+            const alias = try parseOptAlias(allocator, tok, cur) orelse try allocator.dupe(u8, @tagName(af));
+            return .{ .key = a.key, .alias = alias, .agg = af, .expr = a.expr };
+        }
+    }
+
+    // EXPAND(field) / EXPAND(split(field, "delim")) — unnest into rows
+    if (cur.tag == .kw_expand and !is_add) {
+        cur.* = try tok.next();
+        if (cur.tag != .lparen) return error.UnexpectedToken;
+        cur.* = try tok.next();
+        const in_split = cur.tag == .kw_split;
+        if (in_split) {
+            cur.* = try tok.next();
+            if (cur.tag != .lparen) return error.UnexpectedToken;
+            cur.* = try tok.next();
+        }
+        const exp_field = try parseGlobKey(allocator, tok, cur);
+        errdefer allocator.free(exp_field);
+        var delim: ?[]const u8 = null;
+        errdefer if (delim) |d| allocator.free(d);
+        if (in_split) {
+            if (cur.tag != .comma) return error.UnexpectedToken;
+            cur.* = try tok.next();
+            if (cur.tag != .string) return error.UnexpectedToken;
+            delim = try allocator.dupe(u8, cur.text);
+            cur.* = try tok.next();
+            if (cur.tag != .rparen) return error.UnexpectedToken; // close split(
+            cur.* = try tok.next();
+        }
+        if (cur.tag != .rparen) return error.UnexpectedToken; // close expand(
+        cur.* = try tok.next();
+        const alias = try parseOptAlias(allocator, tok, cur);
+        return .{ .key = exp_field, .alias = alias, .is_expand = true, .expand_split_delim = delim };
+    }
+
+    // Computed column starting with CASE or a literal: alias required.
+    if (cur.tag == .kw_case or cur.tag == .string or cur.tag == .lparen) {
+        const e = try parseExpr(allocator, tok, cur);
+        errdefer destroyExpr(allocator, e);
+        return computedField(allocator, tok, cur, e, is_add);
+    }
+
+    // A name: plain field (keyword names allowed), isnull(..), a function
+    // call, or the start of an arithmetic expression.
+    const name_tok = cur.*;
+    const key = try parseGlobKey(allocator, tok, cur);
+    if (cur.tag == .lparen) {
+        if (std.ascii.eqlIgnoreCase(key, "isnull")) {
+            allocator.free(key);
+            return parseIsnull(allocator, tok, cur);
+        }
+        allocator.free(key);
+        const fn_name = isFuncKeyword(name_tok.tag) orelse try lookupFunction(tok, name_tok);
+        const call = try parseCall(allocator, tok, cur, fn_name);
+        const e = try parseExprFrom(allocator, tok, cur, call);
+        errdefer destroyExpr(allocator, e);
+        return computedField(allocator, tok, cur, e, is_add);
+    }
+    if (isArithOp(cur.*)) {
+        const field_node = allocator.create(Expr) catch {
+            allocator.free(key);
+            return error.OutOfMemory;
+        };
+        field_node.* = .{ .field = key }; // key ownership transferred into Expr
+        const e = try parseExprFrom(allocator, tok, cur, field_node);
+        errdefer destroyExpr(allocator, e);
+        return computedField(allocator, tok, cur, e, is_add);
+    }
+    errdefer allocator.free(key);
+    const alias = try parseOptAlias(allocator, tok, cur);
+    return .{ .key = key, .alias = alias, .is_add = is_add };
+}
+
+/// A computed column `expr AS alias` (the alias is required).
+fn computedField(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, e: *Expr, is_add: bool) ParseError!SelectField {
+    const alias = try parseReqAlias(allocator, tok, cur);
+    errdefer allocator.free(alias);
+    const key = try allocator.dupe(u8, alias);
+    return .{ .key = key, .alias = alias, .expr = e, .is_add = is_add };
+}
+
+/// isnull(field, "default") [as alias] — `cur` is at the '('.
+fn parseIsnull(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token) ParseError!SelectField {
+    cur.* = try tok.next();
+    const key = try parseGlobKey(allocator, tok, cur);
+    errdefer allocator.free(key);
+    if (cur.tag != .comma) return error.UnexpectedToken;
+    cur.* = try tok.next();
+    if (cur.tag != .string) return error.UnexpectedToken;
+    const def = try allocator.dupe(u8, cur.text);
+    errdefer allocator.free(def);
+    cur.* = try tok.next();
+    if (cur.tag != .rparen) return error.UnexpectedToken;
+    cur.* = try tok.next();
+    const alias = try parseOptAlias(allocator, tok, cur);
+    return .{ .key = key, .alias = alias, .default_val = def };
+}
+
+/// ORDER BY key [asc|desc], ... — keys may be aliases or 1-based ordinals.
+fn parseOrderBy(
+    allocator: std.mem.Allocator,
+    tok: *Tokenizer,
+    cur: *Token,
+    fields: ?[]const SelectField,
+) ParseError![]OrderField {
+    cur.* = try tok.next(); // 'order'
+    if (cur.tag != .kw_by) return error.UnexpectedToken;
+    cur.* = try tok.next();
+    var ob_list = std.array_list.Managed(OrderField).init(allocator);
+    errdefer {
+        for (ob_list.items) |f| allocator.free(f.key);
+        ob_list.deinit();
+    }
+    while (true) {
+        // Ordinal: ORDER BY 1, 2 — resolve to the nth SELECT field key/alias
+        const key: []const u8 = if (cur.tag == .number) blk: {
+            const ord = std.fmt.parseInt(usize, cur.text, 10) catch return error.UnexpectedToken;
+            cur.* = try tok.next();
+            if (fields != null and ord >= 1 and ord <= fields.?.len) {
+                const sf = fields.?[ord - 1];
+                break :blk try allocator.dupe(u8, if (sf.alias) |a| a else sf.key);
+            }
+            break :blk try std.fmt.allocPrint(allocator, "{d}", .{ord});
+        } else try parseGlobKey(allocator, tok, cur);
+        errdefer allocator.free(key);
+        var dir: SortDir = .asc;
+        if (cur.tag == .kw_asc) {
+            cur.* = try tok.next();
+        } else if (cur.tag == .kw_desc) {
+            dir = .desc;
+            cur.* = try tok.next();
+        }
+        try ob_list.append(.{ .key = key, .dir = dir });
+        if (cur.tag != .comma) break;
+        cur.* = try tok.next();
+    }
+    return ob_list.toOwnedSlice();
 }
 
 /// Parse a multi-query string separated by ';'. Each sub-query may have an INTO clause.

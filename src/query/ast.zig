@@ -171,8 +171,9 @@ pub const CaseExpr = struct {
 
 // ---- AST -------------------------------------------------------------------
 
-/// Aggregation function for group-by queries
-pub const AggFunc = enum { sum, avg, min, max, stddev, variance };
+/// Aggregation function for group-by queries. `count` is count(expr): the
+/// number of non-null values; `count_rows` is count() / count(*) / bare count.
+pub const AggFunc = enum { sum, avg, min, max, stddev, variance, count, count_rows };
 
 pub const SelectField = struct {
     key: []const u8,
@@ -193,6 +194,17 @@ pub const SelectField = struct {
     is_expand: bool = false,
     /// When non-null, this expand uses split(key, delim) — split key by delim then expand.
     expand_split_delim: ?[]const u8 = null,
+
+    pub fn deinit(self: SelectField, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        if (self.alias) |a| allocator.free(a);
+        if (self.default_val) |d| allocator.free(d);
+        if (self.expand_split_delim) |d| allocator.free(d);
+        if (self.expr) |e| {
+            e.deinit(allocator);
+            allocator.destroy(e);
+        }
+    }
 };
 
 /// Sentinel SelectField meaning "select *" (all fields). Detected by key == "*".
@@ -300,7 +312,7 @@ pub const Query = struct {
     order_by: ?[]OrderField, // null = no sort
     limit: ?usize, // null = no limit
     group_by: ?[]GroupByKey, // group keys (null = no grouping)
-    has_count: bool, // true when count() is in SELECT
+    has_count: bool, // true when count() / count(*) is in SELECT
     global_agg: bool = false, // true when aggregates appear without group by
     distinct: bool = false, // true when DISTINCT keyword in SELECT
     into: ?[]const u8 = null, // INTO 'path' — output destination file
@@ -309,15 +321,7 @@ pub const Query = struct {
         if (self.into) |p| allocator.free(p);
         if (self.scope_pattern) |s| allocator.free(s);
         if (self.fields) |fields| {
-            for (fields) |f| {
-                allocator.free(f.key);
-                if (f.alias) |a| allocator.free(a);
-                if (f.default_val) |d| allocator.free(d);
-                if (f.expr) |e| {
-                    e.deinit(allocator);
-                    allocator.destroy(e);
-                }
-            }
+            for (fields) |f| f.deinit(allocator);
             allocator.free(fields);
         }
         if (self.where) |w| w.deinit(allocator);

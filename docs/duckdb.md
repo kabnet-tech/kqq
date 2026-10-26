@@ -85,9 +85,9 @@ curl -s localhost:11434/api/generate -d '{...}' \
 
 ## Gotchas
 
-- **Always use `--ndjson`** when piping to `read_json_auto` — DuckDB's JSON
-  reader wants newline-delimited objects, not kqq's default pretty-printed
-  JSON array.
+- **NDJSON is kqq's default output**, which is what `read_json_auto` wants;
+  `--ndjson` just makes that explicit. (Only `--buf` / `--flat` print a single
+  pretty-printed JSON document instead.)
 - **`--csv` for aggregates** is often the cleanest handoff: typed columns, no
   JSON parsing on DuckDB's side.
 - **`--raw`** works too when you're extracting a single column of values.

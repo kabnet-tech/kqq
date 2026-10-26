@@ -259,55 +259,6 @@ pub fn drainAccum(accum: *std.array_list.Managed(u8), end: usize) void {
 
 // ─── Rolling aggregate snapshots ─────────────────────────────────────────────
 
-/// Emit a single NDJSON line with the current rolling aggregate snapshot.
-/// Used by --rolling mode to show running totals after each new object.
-pub fn emitAggSnapshot(
-    writer: *std.Io.Writer,
-    fields: []const SelectField,
-    total_count: usize,
-    sums: []const f64,
-    mins: []const f64,
-    maxs: []const f64,
-    m2s: []const f64,
-    n_num: []const usize,
-    count_alias: []const u8,
-) !void {
-    try writer.writeByte('{');
-    var first = true;
-    if (count_alias.len > 0) {
-        try writer.writeByte('"');
-        try writeJsonEscaped(writer, count_alias);
-        try writer.writeAll("\": ");
-        try writeNumber(writer, @floatFromInt(total_count));
-        first = false;
-    }
-    var agg_idx: usize = 0;
-    for (fields) |f| {
-        if (f.agg == null) continue;
-        defer agg_idx += 1;
-        if (!first) try writer.writeAll(", ");
-        first = false;
-        const name = if (f.alias) |a| a else f.key;
-        try writer.writeByte('"');
-        try writeJsonEscaped(writer, name);
-        try writer.writeAll("\": ");
-        if (n_num[agg_idx] == 0) {
-            try writer.writeAll("null");
-        } else {
-            const val: f64 = switch (f.agg.?) {
-                .sum => sums[agg_idx],
-                .avg => sums[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])),
-                .min => mins[agg_idx],
-                .max => maxs[agg_idx],
-                .variance => m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx])),
-                .stddev => @sqrt(m2s[agg_idx] / @as(f64, @floatFromInt(n_num[agg_idx]))),
-            };
-            try writeNumber(writer, val);
-        }
-    }
-    try writer.writeAll("}\n");
-}
-
 /// Emit a rolling group-by snapshot as a compact JSON array on one line.
 /// Each group is a JSON object; the whole set is `[{...},{...}]\n`.
 pub fn emitGroupBySnapshot(writer: *std.Io.Writer, groups: []Record) !void {
@@ -489,7 +440,7 @@ test "validateSchema: valid record" {
     var rec = Record.init(allocator);
     defer rec.deinit();
     _ = rec.fields.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, "Alice") }) catch {};
-    _ = rec.fields.put(allocator, try allocator.dupe(u8, "price"), .{ .number = 30000 }) catch {};
+    _ = rec.fields.put(allocator, try allocator.dupe(u8, "price"), OwnedValue.num(30000)) catch {};
     const schema = [_]SchemaField{
         .{ .name = "name", .ftype = .string },
         .{ .name = "price", .ftype = .number },
@@ -501,7 +452,7 @@ test "validateSchema: type mismatch" {
     const allocator = std.testing.allocator;
     var rec = Record.init(allocator);
     defer rec.deinit();
-    _ = rec.fields.put(allocator, try allocator.dupe(u8, "name"), .{ .number = 42 }) catch {};
+    _ = rec.fields.put(allocator, try allocator.dupe(u8, "name"), OwnedValue.num(42)) catch {};
     const schema = [_]SchemaField{
         .{ .name = "name", .ftype = .string },
     };
