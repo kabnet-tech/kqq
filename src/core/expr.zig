@@ -269,10 +269,12 @@ fn toI64(f: f64) ?i64 {
     return @intFromFloat(f);
 }
 
-/// Clamp a numeric argument into a usable length/index (NaN → 0).
+/// Clamp a numeric argument into a usable length/index (NaN → 0). The cap
+/// fits usize on 32-bit targets too.
 fn toLen(f: f64) usize {
     if (!(f > 0)) return 0;
-    if (f >= 1e15) return 1 << 50;
+    const cap = std.math.maxInt(u32);
+    if (f >= cap) return cap;
     return @intFromFloat(f);
 }
 
