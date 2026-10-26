@@ -44,6 +44,13 @@ jobs:
       - name: Run CLI tests
         run: python3 tests/cli_tests.py
 
+      - name: Differential tests against DuckDB
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv .venv-duckdb
+          .venv-duckdb/bin/pip install --quiet duckdb
+          .venv-duckdb/bin/python tests/differential.py --seeds 10
+
       - name: Smoke test binary
         run: |
           echo '{"name":"Alice","score":98}' | ./zig-out/bin/kqq 'where score > 90'

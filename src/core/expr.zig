@@ -12,6 +12,7 @@ const where_mod = @import("kqq_where");
 const Record = record_mod.Record;
 const OwnedValue = record_mod.OwnedValue;
 const PATH_SEP = record_mod.PATH_SEP;
+const formatF64 = record_mod.formatF64;
 const Expr = query.Expr;
 const FuncName = query.FuncName;
 const recordPassesWhere = where_mod.recordPassesWhere;
@@ -31,13 +32,16 @@ pub fn evalExpr(allocator: std.mem.Allocator, rec: *const Record, expr: *const E
             // Return a freshly-owned copy so callers can always take ownership
             return switch (ov) {
                 .string => |s| OwnedValue{ .string = allocator.dupe(u8, s) catch return null },
-                .number => |n| OwnedValue{ .number = n },
+                .number => |n| OwnedValue{ .number = .{
+                    .f = n.f,
+                    .lit = if (n.lit) |l| allocator.dupe(u8, l) catch return null else null,
+                } },
                 .boolean => |b| OwnedValue{ .boolean = b },
                 .null_val => OwnedValue.null_val,
                 .raw => |r| OwnedValue{ .raw = allocator.dupe(u8, r) catch return null },
             };
         },
-        .lit_num => |n| return OwnedValue{ .number = n },
+        .lit_num => |n| return OwnedValue.num(n),
         .lit_str => |s| {
             const dup = allocator.dupe(u8, s) catch return null;
             return OwnedValue{ .string = dup };
@@ -84,23 +88,27 @@ const BinOp = enum { add, sub, mul, div, mod };
 
 pub fn toF64(ov: OwnedValue) ?f64 {
     return switch (ov) {
-        .number => |n| n,
+        .number => |n| n.f,
         .string => |s| std.fmt.parseFloat(f64, s) catch null,
         else => null,
     };
 }
 
+/// Arithmetic on two values. Returns null (cannot evaluate) when either side
+/// is not numeric; division or modulo by zero yields SQL NULL (`.null_val`),
+/// so a computed column is emitted as `null` rather than silently dropped.
 pub fn numericBinOp(l: OwnedValue, r: OwnedValue, op: BinOp) ?OwnedValue {
     const a = toF64(l) orelse return null;
     const b = toF64(r) orelse return null;
+    if ((op == .div or op == .mod) and b == 0.0) return OwnedValue.null_val;
     const result: f64 = switch (op) {
         .add => a + b,
         .sub => a - b,
         .mul => a * b,
-        .div => if (b == 0.0) return null else a / b,
+        .div => a / b,
         .mod => @rem(a, b),
     };
-    return OwnedValue{ .number = result };
+    return OwnedValue.num(result);
 }
 
 /// Append a JSON-escaped string literal (with surrounding quotes) to a byte list.
@@ -124,8 +132,7 @@ pub fn appendOwnedJson(buf: *std.array_list.Managed(u8), ov: OwnedValue) !void {
         .boolean => |b| try buf.appendSlice(if (b) "true" else "false"),
         .number => |n| {
             var tmp: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.OutOfMemory;
-            try buf.appendSlice(s);
+            try buf.appendSlice(n.text(&tmp));
         },
         .string => |s| try appendJsonStr(buf, s),
         .raw => |r| try buf.appendSlice(r),
@@ -144,8 +151,7 @@ pub fn appendParsedJson(buf: *std.array_list.Managed(u8), val: std.json.Value) !
         },
         .float => |f| {
             var tmp: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch return error.OutOfMemory;
-            try buf.appendSlice(s);
+            try buf.appendSlice(formatF64(&tmp, f));
         },
         .number_string => |s| try buf.appendSlice(s),
         .string => |s| try appendJsonStr(buf, s),
@@ -256,19 +262,39 @@ fn parseIsoSecs(s: []const u8) ?i64 {
     return base;
 }
 
+/// f64 → i64, or null when the value is NaN, infinite or out of range
+/// (a bare @intFromFloat on such values is undefined behaviour).
+fn toI64(f: f64) ?i64 {
+    if (!std.math.isFinite(f) or @abs(f) >= 9.2e18) return null;
+    return @intFromFloat(f);
+}
+
+/// Clamp a numeric argument into a usable length/index (NaN → 0). The cap
+/// fits usize on 32-bit targets too.
+fn toLen(f: f64) usize {
+    if (!(f > 0)) return 0;
+    const cap = std.math.maxInt(u32);
+    if (f >= cap) return cap;
+    return @intFromFloat(f);
+}
+
 /// Coerce an OwnedValue to epoch seconds. Numbers pass through; strings are parsed.
 fn toEpochSecs(v: OwnedValue) ?i64 {
     return switch (v) {
-        .number => |n| @intFromFloat(n),
+        .number => |n| toI64(n.f),
         .string => |s| parseIsoSecs(s),
         else => null,
     };
 }
 
+/// 9999-12-31T23:59:59Z. Calendar decomposition walks year by year, so larger
+/// inputs are rejected rather than looping for minutes.
+const max_epoch_secs: i64 = 253402300799;
+
 /// Format epoch seconds (>= 0) as "YYYY-MM-DDTHH:MM:SSZ" into allocator.
 /// Returns null for pre-epoch times (negative seconds) to avoid u64 overflow.
 fn epochToIso(allocator: std.mem.Allocator, secs: i64) ?[]u8 {
-    if (secs < 0) return null;
+    if (secs < 0 or secs > max_epoch_secs) return null;
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
     const ed = es.getEpochDay();
     const yd = ed.calculateYearDay();
@@ -326,7 +352,7 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
                 },
                 else => return null,
             };
-            return OwnedValue{ .number = l };
+            return OwnedValue.num(l);
         },
         .trim => {
             if (args.len != 1) return null;
@@ -344,25 +370,25 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
                 break :blk toF64(d) orelse 0.0;
             } else 0.0;
             const factor = std.math.pow(f64, 10.0, decimals);
-            return OwnedValue{ .number = @round(n * factor) / factor };
+            return OwnedValue.num(@round(n * factor) / factor);
         },
         .floor => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = @floor(n) };
+            return OwnedValue.num(@floor(n));
         },
         .ceil => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = @ceil(n) };
+            return OwnedValue.num(@ceil(n));
         },
         .abs => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = @abs(n) };
+            return OwnedValue.num(@abs(n));
         },
         .concat => {
             // concat(a, b, ...) — join all string/number args into one string
@@ -373,9 +399,8 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
                 switch (v) {
                     .string => |s| buf.appendSlice(s) catch return null,
                     .number => |nx| {
-                        var ftmp: [32]u8 = undefined;
-                        const formatted = std.fmt.bufPrint(&ftmp, "{d}", .{nx}) catch return null;
-                        buf.appendSlice(formatted) catch return null;
+                        var ftmp: [64]u8 = undefined;
+                        buf.appendSlice(nx.text(&ftmp)) catch return null;
                     },
                     else => return null,
                 }
@@ -388,15 +413,15 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             const sv = evalExpr(tmp, rec, args[0]) orelse return null;
             if (sv != .string) return null;
             const start_v = evalExpr(tmp, rec, args[1]) orelse return null;
-            const start: usize = @intFromFloat(@max(0.0, toF64(start_v) orelse return null));
+            const start = toLen(toF64(start_v) orelse return null);
             const slen: usize = if (args.len >= 3) blk: {
                 const lv = evalExpr(tmp, rec, args[2]) orelse break :blk sv.string.len;
-                break :blk @intFromFloat(@max(0.0, toF64(lv) orelse @as(f64, @floatFromInt(sv.string.len))));
+                break :blk if (toF64(lv)) |l| toLen(l) else sv.string.len;
             } else sv.string.len;
             if (start >= sv.string.len) {
                 return OwnedValue{ .string = allocator.dupe(u8, "") catch return null };
             }
-            const end = @min(start + slen, sv.string.len);
+            const end = start + @min(slen, sv.string.len - start);
             return OwnedValue{ .string = allocator.dupe(u8, sv.string[start..end]) catch return null };
         },
         .to_str => {
@@ -406,8 +431,7 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
                 .string => |s| return OwnedValue{ .string = allocator.dupe(u8, s) catch return null },
                 .number => |n| {
                     var buf: [64]u8 = undefined;
-                    const formatted = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return null;
-                    return OwnedValue{ .string = allocator.dupe(u8, formatted) catch return null };
+                    return OwnedValue{ .string = allocator.dupe(u8, n.text(&buf)) catch return null };
                 },
                 .boolean => |b| return OwnedValue{ .string = allocator.dupe(u8, if (b) "true" else "false") catch return null },
                 else => return null,
@@ -417,12 +441,12 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             switch (v) {
-                .number => |n| return OwnedValue{ .number = n },
+                .number => |n| return OwnedValue.num(n.f),
                 .string => |s| {
                     const n = std.fmt.parseFloat(f64, s) catch return null;
-                    return OwnedValue{ .number = n };
+                    return OwnedValue.num(n);
                 },
-                .boolean => |b| return OwnedValue{ .number = if (b) 1.0 else 0.0 },
+                .boolean => |b| return OwnedValue.num(if (b) 1.0 else 0.0),
                 else => return null,
             }
         },
@@ -448,8 +472,7 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
                             .string => |s| out.appendSlice(s) catch return null,
                             .number => |n| {
                                 var nbuf: [64]u8 = undefined;
-                                const ns = std.fmt.bufPrint(&nbuf, "{d}", .{n}) catch return null;
-                                out.appendSlice(ns) catch return null;
+                                out.appendSlice(n.text(&nbuf)) catch return null;
                             },
                             .boolean => |b| out.appendSlice(if (b) "true" else "false") catch return null,
                             else => out.appendSlice("") catch return null,
@@ -517,7 +540,7 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             const sv = evalExpr(tmp, rec, args[0]) orelse return null;
             if (sv != .string) return null;
             const len_v = evalExpr(tmp, rec, args[1]) orelse return null;
-            const target_len: usize = @intFromFloat(@max(0.0, toF64(len_v) orelse return null));
+            const target_len = toLen(toF64(len_v) orelse return null);
             const pad_v = evalExpr(tmp, rec, args[2]) orelse return null;
             if (pad_v != .string or pad_v.string.len == 0) return null;
             const pad_ch = pad_v.string[0];
@@ -534,7 +557,7 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             const sv = evalExpr(tmp, rec, args[0]) orelse return null;
             if (sv != .string) return null;
             const len_v = evalExpr(tmp, rec, args[1]) orelse return null;
-            const target_len: usize = @intFromFloat(@max(0.0, toF64(len_v) orelse return null));
+            const target_len = toLen(toF64(len_v) orelse return null);
             const pad_v = evalExpr(tmp, rec, args[2]) orelse return null;
             if (pad_v != .string or pad_v.string.len == 0) return null;
             const pad_ch = pad_v.string[0];
@@ -712,11 +735,11 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
         },
         .now_epoch => {
             if (args.len != 0) return null;
-            return OwnedValue{ .number = @floatFromInt(utcNowSecs()) };
+            return OwnedValue.num(@floatFromInt(utcNowSecs()));
         },
         .now_ms => {
             if (args.len != 0) return null;
-            return OwnedValue{ .number = @floatFromInt(utcNowMs()) };
+            return OwnedValue.num(@floatFromInt(utcNowMs()));
         },
         .from_epoch => {
             if (args.len != 1) return null;
@@ -728,7 +751,7 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const ms: i64 = switch (v) {
-                .number => |n| @intFromFloat(n),
+                .number => |n| toI64(n.f) orelse return null,
                 .string => |s| blk: {
                     const secs = parseIsoSecs(s) orelse return null;
                     break :blk secs * 1000;
@@ -741,13 +764,13 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const secs = toEpochSecs(v) orelse return null;
-            return OwnedValue{ .number = @floatFromInt(secs) };
+            return OwnedValue.num(@floatFromInt(secs));
         },
         .to_epoch_ms => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const secs = toEpochSecs(v) orelse return null;
-            return OwnedValue{ .number = @floatFromInt(secs * 1000) };
+            return OwnedValue.num(@as(f64, @floatFromInt(secs)) * 1000);
         },
         .date_part => {
             if (args.len != 2) return null;
@@ -756,26 +779,26 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             if (comp_v != .string) return null;
             const comp = comp_v.string;
             const secs = toEpochSecs(ts_v) orelse return null;
-            if (std.mem.eql(u8, comp, "epoch")) return OwnedValue{ .number = @floatFromInt(secs) };
-            if (secs < 0) return null; // pre-1970 not supported in epoch decomposition
+            if (std.mem.eql(u8, comp, "epoch")) return OwnedValue.num(@floatFromInt(secs));
+            if (secs < 0 or secs > max_epoch_secs) return null; // pre-1970 / post-9999 not supported
             const es = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
             if (std.mem.eql(u8, comp, "hour")) {
-                return OwnedValue{ .number = @floatFromInt(es.getDaySeconds().getHoursIntoDay()) };
+                return OwnedValue.num(@floatFromInt(es.getDaySeconds().getHoursIntoDay()));
             } else if (std.mem.eql(u8, comp, "minute")) {
-                return OwnedValue{ .number = @floatFromInt(es.getDaySeconds().getMinutesIntoHour()) };
+                return OwnedValue.num(@floatFromInt(es.getDaySeconds().getMinutesIntoHour()));
             } else if (std.mem.eql(u8, comp, "second")) {
-                return OwnedValue{ .number = @floatFromInt(es.getDaySeconds().getSecondsIntoMinute()) };
+                return OwnedValue.num(@floatFromInt(es.getDaySeconds().getSecondsIntoMinute()));
             }
             const ed = es.getEpochDay();
             const yd = ed.calculateYearDay();
             if (std.mem.eql(u8, comp, "year")) {
-                return OwnedValue{ .number = @floatFromInt(yd.year) };
+                return OwnedValue.num(@floatFromInt(yd.year));
             }
             const md = yd.calculateMonthDay();
             if (std.mem.eql(u8, comp, "month")) {
-                return OwnedValue{ .number = @floatFromInt(@intFromEnum(md.month)) };
+                return OwnedValue.num(@floatFromInt(@intFromEnum(md.month)));
             } else if (std.mem.eql(u8, comp, "day")) {
-                return OwnedValue{ .number = @floatFromInt(md.day_index + 1) };
+                return OwnedValue.num(@floatFromInt(md.day_index + 1));
             }
             return null;
         },
@@ -783,25 +806,25 @@ pub fn evalFunc(allocator: std.mem.Allocator, rec: *const Record, name: FuncName
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = n * 60.0 };
+            return OwnedValue.num(n * 60.0);
         },
         .epoch_hour => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = n * 3600.0 };
+            return OwnedValue.num(n * 3600.0);
         },
         .epoch_day => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = n * 86400.0 };
+            return OwnedValue.num(n * 86400.0);
         },
         .epoch_week => {
             if (args.len != 1) return null;
             const v = evalExpr(tmp, rec, args[0]) orelse return null;
             const n = toF64(v) orelse return null;
-            return OwnedValue{ .number = n * 604800.0 };
+            return OwnedValue.num(n * 604800.0);
         },
     }
 }

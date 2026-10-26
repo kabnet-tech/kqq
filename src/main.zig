@@ -44,6 +44,7 @@ fn dieErr(err: anyerror) noreturn {
         error.NoLlmField => "LLM mode requires --llm <field> or --llm-path <path>",
         error.NoScope => "scoped executor requires a scope pattern",
         error.InvalidSchema => "invalid --expect schema (format: name:type, ...)",
+        error.TooManyGroupKeys => "GROUP BY supports at most 16 keys",
         else => @errorName(err),
     };
     die(msg);
@@ -76,6 +77,11 @@ fn dieQuery(query: []const u8, fail_pos: ?usize, parse_err: anyerror) noreturn {
                     w.print("error: unexpected end of query at column {d}\n", .{col + 1}) catch {};
                 }
             },
+            error.UnknownFunction => {
+                var end = col;
+                while (end < query.len and (std.ascii.isAlphanumeric(query[end]) or query[end] == '_')) end += 1;
+                w.print("error: unknown function '{s}' at column {d}\n", .{ query[col..end], col + 1 }) catch {};
+            },
             else => {
                 w.print("error: failed to parse query (column {d})\n", .{col + 1}) catch {};
             },
@@ -107,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
     //   kqq [--flat] [--buf] [--ndjson] ['query']
     //   --flat        : flatten JSON to dot-path keys before querying
     //   --buf         : buffer entire input (disables streaming)
-    //   --ndjson      : input is newline-delimited JSON (one object per line)
+    //   --ndjson      : NDJSON output, one object per line (the default)
     //   --raw/-r      : emit bare values (unquoted strings, one per line)
     //   --csv         : emit CSV output (with header row)
     //   --tsv         : emit TSV output (with header row)
@@ -155,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Options:
                 \\  --flat            Flatten nested JSON to dot-path keys
                 \\  --buf             Force buffered (non-streaming) mode
-                \\  --ndjson          NDJSON output: one object per line, no array wrapper
+                \\  --ndjson          NDJSON output, one object per line (the default)
                 \\  --raw, -r         Bare values, one per line (no JSON wrapper)
                 \\  --csv             CSV output with header row
                 \\  --tsv             TSV output with header row
@@ -790,6 +796,8 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 _ = kqq_stream_exec.execGenericSource(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             }
+            if (src.unterminated_record) |n|
+                warn("record {d}: quoted field never closed; it runs to the end of the input", .{n});
         }
         try primary_out.flush();
         return;
@@ -928,7 +936,8 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
         } else {
-            // No query: passthrough all records as array
+            // No query: pass every record through, honouring the output flags
+            // (NDJSON by default, like any query).
             var stdin_rbuf: [65536]u8 = undefined;
             var stdin_file_reader = std.Io.File.stdin().reader(io, &stdin_rbuf);
             const empty_q = kqq_query.Query{
@@ -942,14 +951,22 @@ pub fn main(init: std.process.Init) !void {
                 .global_agg = false,
                 .distinct = false,
             };
+            var skip_count: usize = 0;
             _ = kqq_stream_exec.execStreamNDJSON(
                 allocator,
                 &stdin_file_reader.interface,
                 empty_q,
                 primary_out,
-                .{},
+                .{
+                    .raw = raw_mode,
+                    .format = out_format,
+                    .tee_writer = tee_iface,
+                    .reject_writer = reject_iface,
+                    .skipped_records = &skip_count,
+                },
             ) catch |err| dieErr(err);
             try primary_out.flush();
+            if (skip_count > 0) warn("{d} record(s) skipped (malformed JSON)", .{skip_count});
             return;
         }
     }

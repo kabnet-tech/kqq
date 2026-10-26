@@ -16,11 +16,18 @@ const query = @import("kqq_query");
 
 const Op = query.Op;
 
+/// Result of scanning raw bytes for a top-level field.
+pub const RawField = union(enum) {
+    found: []const u8, // the raw value bytes (number/bool/null/"string"/...)
+    absent,
+    /// A top-level key is written with escapes (`"\u0061"` is `a`), so raw
+    /// bytes cannot tell whether it is the field — parse the record instead.
+    unknown,
+};
+
 /// Scan a raw JSON object for a top-level field by name.
-/// Returns a slice of the raw value bytes (number/bool/null/string/"..."),
-/// or null if the key is not present at depth 1.
-/// Only correct for key names that contain no backslash escapes.
-pub fn rawScanField(raw: []const u8, field: []const u8) ?[]const u8 {
+pub fn rawScanField(raw: []const u8, field: []const u8) RawField {
+    var escaped_key = false;
     var i: usize = 0;
     var depth: u32 = 0;
 
@@ -53,11 +60,12 @@ pub fn rawScanField(raw: []const u8, field: []const u8) ?[]const u8 {
                 while (i < raw.len and (raw[i] == ' ' or raw[i] == '\t')) i += 1;
 
                 const found_key = raw[key_start..key_end];
+                if (depth == 1 and std.mem.indexOfScalar(u8, found_key, '\\') != null) escaped_key = true;
                 if (depth == 1 and std.mem.eql(u8, found_key, field)) {
                     // This is the field we want. Capture the raw value.
                     const val_start = i;
                     i = rawSkipValue(raw, i);
-                    return raw[val_start..i];
+                    return .{ .found = raw[val_start..i] };
                 } else {
                     // Not our key — skip the value
                     i = rawSkipValue(raw, i);
@@ -66,7 +74,7 @@ pub fn rawScanField(raw: []const u8, field: []const u8) ?[]const u8 {
             else => i += 1,
         }
     }
-    return null;
+    return if (escaped_key) .unknown else .absent;
 }
 
 /// Skip one complete JSON value starting at `start`, return index after it.
@@ -192,24 +200,24 @@ pub fn tryCondOnRaw(raw: []const u8, cond: query.Condition) ?bool {
     // Nested field access (dots → PATH_SEP) — needs full parse
     if (std.mem.indexOfScalar(u8, cond.key, '.') != null) return null;
 
+    const raw_val: ?[]const u8 = switch (rawScanField(raw, cond.key)) {
+        .found => |v| v,
+        .absent => null,
+        .unknown => return null,
+    };
     switch (cond.op) {
         .is_null => {
-            const raw_val = rawScanField(raw, cond.key);
-            if (raw_val == null) return true; // absent field counts as null
-            const v = std.mem.trim(u8, raw_val.?, " \t");
+            const v = std.mem.trim(u8, raw_val orelse return true, " \t"); // absent counts as null
             return std.mem.eql(u8, v, "null");
         },
         .is_not_null => {
-            const raw_val = rawScanField(raw, cond.key);
-            if (raw_val == null) return false;
-            const v = std.mem.trim(u8, raw_val.?, " \t");
+            const v = std.mem.trim(u8, raw_val orelse return false, " \t");
             return !std.mem.eql(u8, v, "null");
         },
-        .has_key => return rawScanField(raw, cond.key) != null,
-        .not_has_key => return rawScanField(raw, cond.key) == null,
+        .has_key => return raw_val != null,
+        .not_has_key => return raw_val == null,
         .eq, .neq, .gt, .lt, .gte, .lte => {
-            const raw_val = rawScanField(raw, cond.key) orelse return false;
-            return rawValueCmp(raw_val, cond.op, cond.value);
+            return rawValueCmp(raw_val orelse return false, cond.op, cond.value);
         },
         // LIKE / regex / contains / IN — fall back to full parse
         else => return null,

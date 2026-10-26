@@ -11,11 +11,59 @@ const query = @import("kqq_query");
 
 const OrderField = query.OrderField;
 
+// ─── Number ───────────────────────────────────────────────────────────────────
+
+/// A numeric value. `f` drives all arithmetic and comparison. `lit` keeps the
+/// exact source text of a number an f64 would print differently — an integer
+/// literal past 2^53 (`9007199254740993`) or one that overflows (`1e400`) —
+/// so passthrough output reproduces the input. Heap-owned when non-null.
+pub const Number = struct {
+    f: f64,
+    lit: ?[]const u8 = null,
+
+    pub fn of(f: f64) Number {
+        return .{ .f = f };
+    }
+
+    /// JSON text for this number: the kept literal, else `formatF64`.
+    pub fn text(self: Number, buf: *[64]u8) []const u8 {
+        return self.lit orelse formatF64(buf, self.f);
+    }
+
+    /// Build from a JSON number literal, keeping the text only when needed.
+    pub fn fromLiteral(allocator: std.mem.Allocator, f: f64, literal: []const u8) !Number {
+        if (!needsLiteral(f, literal)) return .{ .f = f };
+        return .{ .f = f, .lit = try allocator.dupe(u8, literal) };
+    }
+
+    /// True when formatting `f` would not reproduce the value of `literal`.
+    pub fn needsLiteral(f: f64, literal: []const u8) bool {
+        if (!std.math.isFinite(f)) return true;
+        if (std.mem.indexOfAny(u8, literal, ".eE") != null) return false;
+        const digits = if (literal.len > 0 and literal[0] == '-') literal.len - 1 else literal.len;
+        return digits > 15; // every integer of <= 15 digits is exact in an f64
+    }
+};
+
+/// Format an f64 as JSON number text: plain decimal for magnitudes in
+/// [1e-6, 1e21) (and zero), shortest round-trip scientific notation outside
+/// that range, `null` for NaN and infinities (JSON has no spelling for them).
+pub fn formatF64(buf: *[64]u8, n: f64) []const u8 {
+    if (!std.math.isFinite(n)) return "null";
+    const mag = @abs(n);
+    const decimal = mag == 0 or (mag >= 1e-6 and mag < 1e21);
+    // Neither form can exceed 64 bytes inside those bounds.
+    return (if (decimal)
+        std.fmt.bufPrint(buf, "{d}", .{n})
+    else
+        std.fmt.bufPrint(buf, "{e}", .{n})) catch unreachable;
+}
+
 // ─── OwnedValue ───────────────────────────────────────────────────────────────
 
 pub const OwnedValue = union(enum) {
     string: []u8, // heap-owned
-    number: f64,
+    number: Number,
     boolean: bool,
     null_val,
     // We deliberately do NOT support nested objects/arrays inside a record
@@ -28,8 +76,13 @@ pub const OwnedValue = union(enum) {
         switch (self) {
             .string => |s| allocator.free(s),
             .raw => |r| allocator.free(r),
+            .number => |n| if (n.lit) |l| allocator.free(l),
             else => {},
         }
+    }
+
+    pub fn num(f: f64) OwnedValue {
+        return .{ .number = .of(f) };
     }
 
     /// Deep-copy an OwnedValue into `allocator`. Strings and raws are duped;
@@ -37,7 +90,10 @@ pub const OwnedValue = union(enum) {
     pub fn copy(self: OwnedValue, allocator: std.mem.Allocator) !OwnedValue {
         return switch (self) {
             .string => |s| .{ .string = try allocator.dupe(u8, s) },
-            .number => |n| .{ .number = n },
+            .number => |n| .{ .number = .{
+                .f = n.f,
+                .lit = if (n.lit) |l| try allocator.dupe(u8, l) else null,
+            } },
             .boolean => |b| .{ .boolean = b },
             .null_val => .null_val,
             .raw => |r| .{ .raw = try allocator.dupe(u8, r) },
@@ -48,7 +104,7 @@ pub const OwnedValue = union(enum) {
     pub fn toJsonValue(self: OwnedValue) std.json.Value {
         return switch (self) {
             .string => |s| .{ .string = s },
-            .number => |n| .{ .float = n },
+            .number => |n| if (n.lit) |l| .{ .number_string = l } else .{ .float = n.f },
             .boolean => |b| .{ .bool = b },
             .null_val => .null,
             .raw => |r| .{ .string = r }, // emit raw as string; good enough for output
@@ -79,6 +135,17 @@ pub const Record = struct {
             e.value_ptr.*.deinit(self.allocator);
         }
         self.fields.deinit(self.allocator);
+    }
+
+    /// Insert an owned key/value. If the key is already present (two output
+    /// columns with one name) the new value wins and nothing leaks.
+    pub fn putOwned(self: *Record, key: []u8, val: OwnedValue) !void {
+        const gop = try self.fields.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            gop.value_ptr.deinit(self.allocator);
+        }
+        gop.value_ptr.* = val;
     }
 
     /// Look up a field by name.  Query field names use '.' as the path separator
@@ -144,8 +211,8 @@ pub fn compareRecords(ob: []const OrderField, a: *const Record, b: *const Record
         const bv = b.get(f.key);
         const ord: std.math.Order = blk: {
             if (av != null and bv != null) {
-                const a_num = if (av.? == .number) av.?.number else null;
-                const b_num = if (bv.? == .number) bv.?.number else null;
+                const a_num = if (av.? == .number) av.?.number.f else null;
+                const b_num = if (bv.? == .number) bv.?.number.f else null;
                 if (a_num != null and b_num != null) {
                     if (a_num.? < b_num.?) break :blk .lt;
                     if (a_num.? > b_num.?) break :blk .gt;

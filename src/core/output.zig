@@ -8,6 +8,7 @@ const record_mod = @import("kqq_record");
 
 const Record = record_mod.Record;
 const OwnedValue = record_mod.OwnedValue;
+const Number = record_mod.Number;
 
 // ─── Output format enum ──────────────────────────────────────────────────────
 
@@ -15,11 +16,16 @@ pub const OutputFormat = enum { json, csv, tsv, raw, ndjson };
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
-/// Write a number as `{d}` to a writer. Used everywhere numbers are emitted.
+/// Write an f64 as a JSON number (see `record.formatF64`).
 pub fn writeNumber(writer: *std.Io.Writer, n: f64) !void {
     var tmp: [64]u8 = undefined;
-    const ns = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch "0";
-    try writer.writeAll(ns);
+    try writer.writeAll(record_mod.formatF64(&tmp, n));
+}
+
+/// Write a Number, reproducing its source literal when one was kept.
+pub fn writeNum(writer: *std.Io.Writer, n: Number) !void {
+    var tmp: [64]u8 = undefined;
+    try writer.writeAll(n.text(&tmp));
 }
 
 /// Write a Record as a JSON object `{ "key": value, ... }` (no trailing newline).
@@ -49,8 +55,9 @@ pub fn emitRecordNdjsonLine(rec: *const Record, writer: *std.Io.Writer) !void {
     try writer.writeAll("\n");
 }
 
-/// Emit a projected Record in streaming-emit mode (no ORDER BY / DISTINCT / CSV).
-/// Handles json and ndjson formats only; csv/tsv are unreachable here.
+/// Emit a projected Record in streaming-emit mode (no ORDER BY / EXPAND / CSV).
+/// Handles json, ndjson and raw formats; csv/tsv are unreachable here.
+/// Does not flush: the caller decides when output must reach the pipe.
 pub fn emitStreamingRecord(writer: *std.Io.Writer, rec: *Record, fmt: OutputFormat, json_first: *bool) !void {
     switch (fmt) {
         .json => {
@@ -63,13 +70,11 @@ pub fn emitStreamingRecord(writer: *std.Io.Writer, rec: *Record, fmt: OutputForm
         .ndjson => {
             try writeRecordJson(writer, rec);
             try writer.writeByte('\n');
-            try writer.flush();
         },
         .raw => {
             var it = rec.fields.iterator();
             if (it.next()) |e| try writeOwnedValueRaw(writer, e.value_ptr.*);
             try writer.writeByte('\n');
-            try writer.flush();
         },
         .csv, .tsv => unreachable,
     }
@@ -83,7 +88,7 @@ pub fn writeOwnedValue(writer: *std.Io.Writer, v: OwnedValue) !void {
             try writeJsonEscaped(writer, s);
             try writer.writeByte('"');
         },
-        .number => |n| try writeNumber(writer, n),
+        .number => |n| try writeNum(writer, n),
         .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
         .null_val => try writer.writeAll("null"),
         .raw => |r| try writer.writeAll(r),
@@ -94,7 +99,7 @@ pub fn writeOwnedValue(writer: *std.Io.Writer, v: OwnedValue) !void {
 pub fn writeOwnedValueRaw(writer: *std.Io.Writer, v: OwnedValue) !void {
     switch (v) {
         .string => |s| try writer.writeAll(s),
-        .number => |n| try writeNumber(writer, n),
+        .number => |n| try writeNum(writer, n),
         .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
         .null_val => try writer.writeAll("null"),
         .raw => |r| try writer.writeAll(r),
@@ -141,7 +146,8 @@ pub fn emitResults(
                 if (rec.get(k)) |v| {
                     switch (v) {
                         .string => |s| try writeCsvField(writer, s, sep),
-                        .number => |n| try writeNumber(writer, n),
+                        // NaN / infinity have no CSV spelling either: empty cell, like null
+                        .number => |n| if (n.lit != null or std.math.isFinite(n.f)) try writeNum(writer, n),
                         .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
                         .null_val => {}, // empty cell
                         .raw => |r| try writeCsvField(writer, r, sep),

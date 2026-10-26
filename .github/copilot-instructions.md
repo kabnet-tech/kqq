@@ -13,7 +13,9 @@ the full input.
 zig build                          # debug build → zig-out/bin/kqq
 zig build -Doptimize=ReleaseFast   # release build (ALWAYS use for benchmarks)
 zig build test --summary all       # unit + integration tests (8 suites)
-python3 tests/cli_tests.py         # end-to-end CLI tests (63 tests)
+python3 tests/cli_tests.py         # end-to-end CLI tests (117 tests)
+python3 tests/differential.py      # kqq vs DuckDB on random data (needs `pip install duckdb`)
+zig build fuzz --fuzz=1M           # fuzz the JSON scanner (src/stream.zig)
 ```
 
 Run the full test suite after every change. Both layers must pass.
@@ -30,6 +32,9 @@ Data flows: **parse → AST → execute → emit**
   (the heart of GROUP BY). ~4550 lines.
 - `src/core/where.zig` — WHERE evaluation against Records.
 - `src/core/raw_where.zig` — fast-path WHERE on raw JSON bytes (skips parse).
+- `src/stream.zig` — strict streaming JSON scanner, plus `isValidJson`, the
+  non-allocating validator the raw fast path uses before echoing a line.
+- `src/record_source.zig` — text and delimited (RFC 4180 CSV) record sources.
 - `src/core/expr.zig` — expression evaluator + built-in functions.
 - `src/core/record.zig` — Record type (arena-allocated key/value pairs).
 - `src/main.zig` — CLI flag parsing and dispatch.
@@ -48,6 +53,9 @@ Data flows: **parse → AST → execute → emit**
    needs an `errdefer`/`deinit` counterpart. Match the existing patterns.
 5. **WHERE leaf conditions with `lhs_expr != null`** have the synthetic key
    `"__expr__"` — skip them in any key-rewriting pass.
+6. **Malformed input is skipped, never echoed.** A line the raw fast path
+   emits or rejects verbatim must pass `stream.isValidJson`; scanner syntax
+   errors (`stream.isSyntaxError`) count as skipped records in NDJSON mode.
 
 ## Conventions
 

@@ -14,7 +14,10 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-KQQ = str(ROOT / "zig-out/bin/kqq")
+KQQ = os.environ.get("KQQ_BIN") or str(ROOT / "zig-out/bin/kqq")
+# Generous per-invocation timeout: a hang (e.g. the old truncated-JSON spin)
+# must fail the test instead of wedging the whole suite.
+TIMEOUT_S = 10
 
 NDJSON_USERS = b"""\
 {"name":"Alice","age":30,"active":true}
@@ -43,18 +46,29 @@ def run(args, *, stdin=b"", env=None, expect_exit=0):
     e = dict(os.environ)
     if env:
         e.update(env)
-    r = subprocess.run(
-        [KQQ] + args,
-        input=stdin,
-        capture_output=True,
-        env=e,
-    )
+    try:
+        r = subprocess.run(
+            [KQQ] + args,
+            input=stdin,
+            capture_output=True,
+            env=e,
+            timeout=TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return b"", f"timed out after {TIMEOUT_S}s".encode(), "timeout"
     return r.stdout, r.stderr, r.returncode
+
+
+def parse_ndjson(text):
+    """Parse NDJSON output into a list of values (blank lines ignored)."""
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def check(name, *, args, stdin=b"", env=None, expect_exit=0,
           stdout_contains=None, stdout_equals=None,
-          stdout_json=None, stderr_contains=None):
+          stdout_json=None, stderr_contains=None,
+          stdout_records=None, stdout_records_unordered=None,
+          stdout_not_contains=None):
     global passed, failed
     out, err, code = run(args, stdin=stdin, env=env)
     out_s = out.decode(errors="replace")
@@ -92,6 +106,27 @@ def check(name, *, args, stdin=b"", env=None, expect_exit=0,
             return
         if got != stdout_json:
             fail(f"JSON mismatch:\n  expected: {stdout_json}\n  got:      {got}")
+            return
+
+    if stdout_not_contains is not None:
+        for needle in (stdout_not_contains if isinstance(stdout_not_contains, list) else [stdout_not_contains]):
+            if needle in out_s:
+                fail(f"stdout unexpectedly contains {needle!r}")
+                return
+
+    for expected, ordered in ((stdout_records, True), (stdout_records_unordered, False)):
+        if expected is None:
+            continue
+        try:
+            got = parse_ndjson(out_s)
+        except json.JSONDecodeError as e:
+            fail(f"stdout is not valid NDJSON: {e}")
+            return
+        if not ordered:
+            key = lambda v: json.dumps(v, sort_keys=True)
+            got, expected = sorted(got, key=key), sorted(expected, key=key)
+        if got != expected:
+            fail(f"records mismatch:\n  expected: {expected}\n  got:      {got}")
             return
 
     if stderr_contains is not None:
@@ -649,6 +684,248 @@ check("invalid query string dies with parse error",
       stdin=b'{"x":1}\n',
       expect_exit=1,
       stderr_contains='unexpected end of query')
+
+# ─── Regressions from the 2026-10-26 portfolio review ────────────────────────
+# Each of these returned a wrong answer with exit 0 (or hung) before the fix.
+
+AB = b'{"a":1,"b":3}\n{"a":2,"b":10}\n'
+
+# 1. Keywords are case-insensitive and unparsed trailing tokens are an error.
+check("review#1 uppercase WHERE filters rows",
+      args=['select a WHERE b > 5'], stdin=AB,
+      stdout_records=[{"a": 2}])
+
+check("review#1 uppercase SELECT projects",
+      args=['SELECT a'], stdin=AB,
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+check("review#1 uppercase ORDER BY / LIMIT applied",
+      args=['select a ORDER BY a DESC LIMIT 1'], stdin=AB,
+      stdout_records=[{"a": 2}])
+
+check("review#1 mixed-case keywords and functions",
+      args=['Select Upper(s) As u Where B Is Not Null'],
+      stdin=b'{"s":"x","B":1}\n{"s":"y"}\n',
+      stdout_records=[{"u": "X"}])
+
+check("review#1 trailing garbage is a parse error",
+      args=['select a where b > 5 garbage'], stdin=AB,
+      expect_exit=1, stderr_contains="unexpected token 'garbage'")
+
+check("review#1 two bare fields without comma is a parse error",
+      args=['select a b'], stdin=AB,
+      expect_exit=1, stderr_contains="unexpected token 'b'")
+
+check("review#1 unknown function is a parse error",
+      args=['select foo(a) as x'], stdin=AB,
+      expect_exit=1, stderr_contains="unknown function 'foo'")
+
+check("review#1 count(*) still parses",
+      args=['select count(*)'], stdin=AB,
+      stdout_records=[{"count": 2}])
+
+check("review#1 HAVING before ORDER BY keeps the ORDER BY",
+      args=['select d, count() as n group by d having n > 0 order by n desc'],
+      stdin=b'{"d":"x"}\n{"d":"y"}\n{"d":"y"}\n',
+      stdout_records=[{"d": "y", "n": 2}, {"d": "x", "n": 1}])
+
+check("review#1 duplicate clause is a parse error",
+      args=['select a limit 1 limit 2'], stdin=AB,
+      expect_exit=1, stderr_contains="unexpected token 'limit'")
+
+# 2. Truncated / malformed JSON: never hang, skip the bad record, keep going.
+TRUNC = b'{"a":1\n{"a":2}\n'
+
+check("review#2 truncated record then good record (select)",
+      args=['select a'], stdin=TRUNC,
+      stdout_records=[{"a": 2}], stderr_contains="1 record(s) skipped")
+
+check("review#2 truncated record then good record (raw WHERE fast path)",
+      args=['where a = 1'], stdin=TRUNC,
+      stdout_equals="", stderr_contains="1 record(s) skipped")
+
+check("review#2 truncated record then good record (passthrough)",
+      args=[], stdin=TRUNC,
+      stdout_records=[{"a": 2}])
+
+check("review#2 truncated record then good record (group by)",
+      args=['select a, count() group by a'], stdin=TRUNC,
+      stdout_records=[{"a": 2, "count": 1}], stderr_contains="1 record(s) skipped")
+
+check("review#2 truncated record then good record (global agg)",
+      args=['select count(), sum(a)'], stdin=TRUNC,
+      stdout_records=[{"count": 1, "sum": 2}], stderr_contains="1 record(s) skipped")
+
+check("review#2 truncated nested object is skipped",
+      args=['select a'], stdin=b'{"a":{"b":1\n{"a":2}\n',
+      stdout_records=[{"a": 2}])
+
+check("review#2 truncated final record at EOF (group by)",
+      args=['select a, count() group by a'], stdin=b'{"a":1}\n{"a":2',
+      stdout_records=[{"a": 1, "count": 1}], stderr_contains="1 record(s) skipped")
+
+check("review#2 truncated scoped document is an error, not a hang",
+      args=['[users.*] select a'], stdin=b'{"users":[{"a":1},{"a":2',
+      expect_exit=1, stderr_contains="truncated")
+
+for bad in [b'{"a":2,,}', b'{"a":2,}', b'{"a" 2}', b'{"a":2 "b":3}', b'{"a":[1,]}',
+            b'{"a":01}', b'{"a":1.}', b'{"a":tru}', b'{"a":"x\\q"}', b'{"a":2}}']:
+    check(f"review#2 malformed {bad.decode()} is rejected",
+          args=['select a'], stdin=bad + b'\n{"a":7}\n',
+          stdout_records=[{"a": 7}], stderr_contains="1 record(s) skipped")
+
+check("review#2 one-object-per-line array (trailing commas) still reads",
+      args=['select a'], stdin=b'[\n{"a":1},\n{"a":2}\n]\n',
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+# 3. RFC 4180 quoting in delimited input.
+QCSV = b'name,amt\n"Smith, John",100\nBob,50\n"Al ""The Pal""",55\nCy,100\n'
+
+check("review#3 quoted comma does not split the field (count/sum)",
+      args=['--delim', ',', '--header', 'select count(), sum(amt)'], stdin=QCSV,
+      stdout_records=[{"count": 4, "sum": 305}])
+
+check("review#3 quoted fields decode",
+      args=['--delim', ',', '--header', 'select name'], stdin=QCSV,
+      stdout_records=[{"name": "Smith, John"}, {"name": "Bob"},
+                      {"name": 'Al "The Pal"'}, {"name": "Cy"}])
+
+check("review#3 quoted field may span lines; quoted header names",
+      args=['--delim', ',', '--header', 'select note, n'],
+      stdin=b'"note","n"\n"line one\nline two",1\nplain,2\n',
+      stdout_records=[{"note": "line one\nline two", "n": 1}, {"note": "plain", "n": 2}])
+
+# 4. \\uXXXX escapes are decoded, including surrogate pairs.
+check("review#4 \\u escapes decode to UTF-8",
+      args=['select n, e'],
+      stdin=b'{"n":"caf\\u00e9","e":"\\ud83d\\ude00"}\n',
+      stdout_records=[{"n": "caf\u00e9", "e": "\U0001F600"}])
+
+check("review#4 WHERE compares decoded text",
+      args=['select n where n = "caf\u00e9"'],
+      stdin=b'{"n":"caf\\u00e9"}\n{"n":"cafe"}\n',
+      stdout_records=[{"n": "caf\u00e9"}])
+
+check("review#4 escaped keys decode",
+      args=['select *'], stdin=b'{"caf\\u00e9":1,"q\\"k":2}\n',
+      stdout_records=[{"caf\u00e9": 1, 'q"k': 2}])
+
+check("review#4 nested strings stay valid JSON",
+      args=['select o'], stdin=b'{"o":{"s":"a\\"b\\\\c\\n","t":"\\u00e9"}}\n',
+      stdout_records=[{"o": {"s": 'a"b\\c\n', "t": "\u00e9"}}])
+
+# 5. Exact integers and large magnitudes survive.
+check("review#5 integer beyond 2^53 passes through exactly",
+      args=['select i'], stdin=b'{"i":9007199254740993}\n{"i":12345678901234567890}\n',
+      stdout_equals='{"i": 9007199254740993}\n{"i": 12345678901234567890}')
+
+check("review#5 large and small magnitudes format as numbers",
+      args=['select f, g, f * 2 as h'], stdin=b'{"f":1e300,"g":1.5e-10}\n',
+      stdout_records=[{"f": 1e300, "g": 1.5e-10, "h": 2e300}])
+
+check("review#5 ordinary numbers unchanged",
+      args=['select a, b, c, d'], stdin=b'{"a":0.1,"b":3.14159,"c":-5,"d":100}\n',
+      stdout_equals='{"a": 0.1, "b": 3.14159, "c": -5, "d": 100}')
+
+check("review#5 big integer group keys stay distinct",
+      args=['select id, count() group by id'],
+      stdin=b'{"id":9007199254740993}\n{"id":9007199254740992}\n{"id":9007199254740993}\n',
+      stdout_records_unordered=[{"id": 9007199254740993, "count": 2},
+                                {"id": 9007199254740992, "count": 1}])
+
+check("review#5 nested numbers keep their text",
+      args=['select o'], stdin=b'{"o":{"i":9007199254740993,"f":1e300}}\n',
+      stdout_records=[{"o": {"i": 9007199254740993, "f": 1e300}}])
+
+# 6. count(expr) and aggregates over expressions keep alias and group key.
+DV = b'{"d":"x","v":1}\n{"d":"x","v":2}\n{"d":"y","v":3}\n'
+
+check("review#6 count(v) as n group by d",
+      args=['select count(v) as n group by d'], stdin=DV,
+      stdout_records_unordered=[{"d": "x", "n": 2}, {"d": "y", "n": 1}])
+
+check("review#6 d, count(v) as n group by d",
+      args=['select d, count(v) as n group by d'], stdin=DV,
+      stdout_records_unordered=[{"d": "x", "n": 2}, {"d": "y", "n": 1}])
+
+check("review#6 count(v) skips null and missing values",
+      args=['select d, count(v) as n, count() as c group by d'],
+      stdin=b'{"d":"x","v":1}\n{"d":"x","v":null}\n{"d":"x"}\n{"d":"y","v":"s"}\n',
+      stdout_records_unordered=[{"d": "x", "n": 1, "c": 3}, {"d": "y", "n": 1, "c": 1}])
+
+check("review#6 aggregate over an expression (group by)",
+      args=['select d, sum(v * 2) as s, max(v + 10) as m group by d'], stdin=DV,
+      stdout_records_unordered=[{"d": "x", "s": 6, "m": 12}, {"d": "y", "s": 6, "m": 13}])
+
+check("review#6 aggregate over an expression (global)",
+      args=['select avg(v * 10) as a, count(v) as n'], stdin=DV,
+      stdout_records=[{"a": 20, "n": 3}])
+
+check("review#6 aggregate over a function call",
+      args=['select max(len(d)) as m'], stdin=b'{"d":"ab"}\n{"d":"abcd"}\n',
+      stdout_records=[{"m": 4}])
+
+# 7. DISTINCT applies before LIMIT.
+DUPS = b'{"a":1}\n{"a":1}\n{"a":1}\n{"a":2}\n{"a":3}\n{"a":4}\n'
+
+check("review#7 distinct ... limit 3 returns 3 distinct rows",
+      args=['select distinct a limit 3'], stdin=DUPS,
+      stdout_records=[{"a": 1}, {"a": 2}, {"a": 3}])
+
+check("review#7 distinct + order by + limit",
+      args=['select distinct a order by a desc limit 2'], stdin=DUPS,
+      stdout_records=[{"a": 4}, {"a": 3}])
+
+check("review#7 distinct with CSV output",
+      args=['--csv', 'select distinct a limit 2'], stdin=DUPS,
+      stdout_equals="a\n1\n2")
+
+check("review#7 distinct in scoped mode",
+      args=['[r.*] select distinct a limit 2'],
+      stdin=b'{"r":[{"a":1},{"a":1},{"a":2},{"a":3}]}',
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+check("review#7 distinct keeps string and number apart",
+      args=['select distinct a'], stdin=b'{"a":1}\n{"a":"1"}\n',
+      stdout_records=[{"a": 1}, {"a": "1"}])
+
+# 8. Division (and modulo) by zero yields null instead of dropping the column.
+check("review#8 a/0 is null, column kept",
+      args=['select a, a / 0 as q, a / b as r'], stdin=b'{"a":1,"b":0}\n',
+      stdout_records=[{"a": 1, "q": None, "r": None}])
+
+check("review#8 a % 0 is null (valid JSON, no -nan)",
+      args=['select a % 0 as m'], stdin=b'{"a":1}\n',
+      stdout_records=[{"m": None}])
+
+# Follow-ups from an independent review of the fixes above.
+check("review#2 record truncated after '[' keeps the next line (aggregates)",
+      args=['select count(), sum(a)'], stdin=b'{"a":1}\n{"a":2,"t":[\n{"a":3}\n{"a":4}\n',
+      stdout_records=[{"count": 3, "sum": 8}], stderr_contains="1 record(s) skipped")
+
+check("review#2 indented NDJSON lines are records",
+      args=['select a'], stdin=b'  {"a":1}\n\t{"a":2}\n',
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+check("review#1 leading number is a literal",
+      args=['select name where 2 * sal > 300'], stdin=b'{"name":"x","sal":200}\n',
+      stdout_records=[{"name": "x"}])
+
+check("review#1 capitalised Count is a field",
+      args=['select name, Count where Count > 8'], stdin=b'{"name":"x","Count":9}\n',
+      stdout_records=[{"name": "x", "Count": 9}])
+
+check("review#6 unaliased aggregates get distinct names",
+      args=['select d, count(), count(n) group by d'], stdin=b'{"d":"x","n":1}\n{"d":"x"}\n',
+      stdout_records=[{"d": "x", "count": 2, "count_n": 1}])
+
+check("review#7 scoped mode skips nested arrays",
+      args=['[x.*] select a'], stdin=b'{"x":[{"a":1},[{"a":9}],{"a":2}]}',
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+check("review#3 unterminated CSV quote warns",
+      args=['--delim', ',', '--header', 'select count()'], stdin=b'h,n\n"oops,1\nr,2\n',
+      stdout_records=[{"count": 1}], stderr_contains="quoted field never closed")
 
 # ─── No-input TTY guard ───────────────────────────────────────────────────────
 # We can't easily fake a TTY in subprocess, so we skip that path.

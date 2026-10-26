@@ -20,6 +20,8 @@ const std = @import("std");
 const kqq_stream_exec = @import("kqq_stream_exec");
 
 pub const OwnedValue = kqq_stream_exec.OwnedValue;
+pub const Number = kqq_stream_exec.Number;
+const isJsonNumber = kqq_stream_exec.isJsonNumber;
 pub const Record = kqq_stream_exec.Record;
 
 // ─── TextLineSource ──────────────────────────────────────────────────────────
@@ -53,34 +55,7 @@ pub const TextLineSource = struct {
         if (self.done) return null;
 
         while (true) {
-            // Try to read a line
-            const raw_line: ?[]const u8 = blk: {
-                if (self.reader.takeDelimiter('\n') catch |err| switch (err) {
-                    error.StreamTooLong => null,
-                    else => return err,
-                }) |slice| {
-                    break :blk slice;
-                }
-                // Slow path: line longer than buffer
-                self.line_buf.clearRetainingCapacity();
-                while (true) {
-                    if (self.reader.takeDelimiter('\n') catch |err| switch (err) {
-                        error.StreamTooLong => null,
-                        else => return err,
-                    }) |chunk| {
-                        try self.line_buf.appendSlice(chunk);
-                        break;
-                    }
-                    if (self.line_buf.items.len == 0) {
-                        self.done = true;
-                        return null;
-                    }
-                    break;
-                }
-                break :blk self.line_buf.items;
-            };
-
-            const line = raw_line orelse {
+            const line = try readLine(self.reader, &self.line_buf) orelse {
                 self.done = true;
                 return null;
             };
@@ -103,19 +78,53 @@ pub const TextLineSource = struct {
 
             const n_key = try self.allocator.dupe(u8, "_n");
             errdefer self.allocator.free(n_key);
-            try rec.fields.put(self.allocator, n_key, OwnedValue{ .number = @floatFromInt(self.line_num) });
+            try rec.fields.put(self.allocator, n_key, OwnedValue.num(@floatFromInt(self.line_num)));
 
             return rec;
         }
     }
 };
 
+/// Read one line (without its '\n'), or null at end of input. Lines that fit
+/// the reader's buffer are returned zero-copy; longer ones are assembled in
+/// `long_buf`. Either way the slice is valid until the next call.
+fn readLine(reader: *std.Io.Reader, long_buf: *std.array_list.Managed(u8)) !?[]const u8 {
+    if (reader.takeDelimiter('\n')) |line| {
+        return line; // null at end of input
+    } else |err| switch (err) {
+        error.StreamTooLong => {},
+        else => |e| return e,
+    }
+    // StreamTooLong leaves the bytes buffered: accumulate via peek + toss
+    // until the newline (or end of input).
+    long_buf.clearRetainingCapacity();
+    while (true) {
+        const window = reader.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        if (std.mem.indexOfScalar(u8, window, '\n')) |pos| {
+            try long_buf.appendSlice(window[0..pos]);
+            reader.toss(pos + 1);
+            break;
+        }
+        try long_buf.appendSlice(window);
+        reader.toss(window.len);
+    }
+    return long_buf.items;
+}
+
 // ─── DelimitedSource ─────────────────────────────────────────────────────────
 //
-// Reads delimiter-separated lines, produces records with named columns.
-// If `header = true`, the first line defines column names.
+// Reads delimiter-separated records, produces records with named columns.
+// If `header = true`, the first record defines column names.
 // Otherwise, columns are named f1, f2, f3, ...
 // Extra columns are named by index. Missing columns become null.
+//
+// Fields follow RFC 4180 quoting: a field that starts with `"` may contain the
+// delimiter, `""` (an escaped quote) and newlines, up to the closing `"`.
+// Quoting only encodes text: "100" and 100 are both the number 100, while an
+// empty quoted field is the empty string and an empty unquoted field is null.
 //
 // Usage:
 //   cat data.csv | kqq --delim ',' --header 'select name, age where age > 30'
@@ -130,8 +139,16 @@ pub const DelimitedSource = struct {
     header_parsed: bool = false,
     use_header: bool,
     line_buf: std.array_list.Managed(u8),
+    /// Decoded field text of the current record, and each field's span in it.
+    text_buf: std.array_list.Managed(u8),
+    fields: std.array_list.Managed(Field),
     line_num: usize = 0,
     done: bool = false,
+    /// Set when input ended inside a quoted field: the record number (`_n`)
+    /// whose last field ran to the end of the input. The caller warns.
+    unterminated_record: ?usize = null,
+
+    const Field = struct { start: usize, end: usize, quoted: bool };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -147,6 +164,8 @@ pub const DelimitedSource = struct {
             .col_names = if (explicit_cols) |ec| @constCast(ec) else null,
             .use_header = use_header,
             .line_buf = std.array_list.Managed(u8).init(allocator),
+            .text_buf = std.array_list.Managed(u8).init(allocator),
+            .fields = std.array_list.Managed(Field).init(allocator),
         };
     }
 
@@ -158,53 +177,120 @@ pub const DelimitedSource = struct {
             }
         }
         self.line_buf.deinit();
+        self.text_buf.deinit();
+        self.fields.deinit();
     }
 
-    fn readLine(self: *DelimitedSource) !?[]const u8 {
-        if (self.reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => null,
-            else => return err,
-        }) |slice| {
-            return slice;
-        }
-        // Slow path
-        self.line_buf.clearRetainingCapacity();
+    /// Read the next non-blank record and split it into `fields`.
+    /// Returns false at end of input.
+    fn readRecord(self: *DelimitedSource) !bool {
         while (true) {
-            if (self.reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => null,
-                else => return err,
-            }) |chunk| {
-                try self.line_buf.appendSlice(chunk);
-                break;
-            }
-            if (self.line_buf.items.len == 0) {
+            const first = try readLine(self.reader, &self.line_buf) orelse {
                 self.done = true;
-                return null;
+                return false;
+            };
+            const line = std.mem.trimEnd(u8, first, "\r");
+            if (line.len == 0) continue;
+            if (!try self.splitFields(line, false)) {
+                // A quoted field is still open: the record continues on the
+                // next line(s). Each line is scanned once, continuing the field.
+                while (try readLine(self.reader, &self.line_buf)) |more| {
+                    if (try self.splitFields(std.mem.trimEnd(u8, more, "\r"), true)) break;
+                } else {
+                    // End of input inside quotes: the field keeps what it has.
+                    self.unterminated_record = self.line_num + 1;
+                }
             }
-            break;
+            return true;
         }
-        return self.line_buf.items;
+    }
+
+    fn isPad(self: *const DelimitedSource, c: u8) bool {
+        return (c == ' ' or c == '\t') and c != self.delimiter;
+    }
+
+    /// Split `line` into decoded fields. With `continuing`, `line` continues
+    /// the quoted field the previous line left open (a newline joins them).
+    /// Returns false when `line` ends inside a quoted field; that last field
+    /// then holds the text read so far.
+    fn splitFields(self: *DelimitedSource, line: []const u8, continuing: bool) !bool {
+        var i: usize = 0;
+        var resume_quoted = false;
+        var resume_start: usize = 0;
+        if (continuing) {
+            resume_start = self.fields.pop().?.start; // the open field
+            try self.text_buf.append('\n');
+            resume_quoted = true;
+        } else {
+            self.fields.clearRetainingCapacity();
+            self.text_buf.clearRetainingCapacity();
+        }
+        while (true) {
+            var start = resume_start;
+            var quoted = resume_quoted;
+            if (!resume_quoted) {
+                while (i < line.len and self.isPad(line[i])) i += 1;
+                start = self.text_buf.items.len;
+                if (i < line.len and line[i] == '"') {
+                    quoted = true;
+                    i += 1;
+                }
+            }
+            resume_quoted = false;
+            if (quoted) {
+                while (true) {
+                    if (i >= line.len) {
+                        // still inside quotes
+                        try self.fields.append(.{ .start = start, .end = self.text_buf.items.len, .quoted = true });
+                        return false;
+                    }
+                    const c = line[i];
+                    i += 1;
+                    if (c == '"') {
+                        if (i < line.len and line[i] == '"') {
+                            try self.text_buf.append('"');
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    try self.text_buf.append(c);
+                }
+                // Text between the closing quote and the delimiter is kept
+                // verbatim (lenient, like Python's csv module), minus padding.
+                const tail_start = i;
+                while (i < line.len and line[i] != self.delimiter) i += 1;
+                try self.text_buf.appendSlice(std.mem.trim(u8, line[tail_start..i], " \t"));
+            } else {
+                const field_start = i;
+                while (i < line.len and line[i] != self.delimiter) i += 1;
+                var field = line[field_start..i];
+                while (field.len > 0 and self.isPad(field[field.len - 1])) field.len -= 1;
+                try self.text_buf.appendSlice(field);
+            }
+            try self.fields.append(.{ .start = start, .end = self.text_buf.items.len, .quoted = quoted });
+            if (i >= line.len) return true;
+            i += 1; // the delimiter: another field follows (possibly empty)
+        }
+    }
+
+    fn fieldText(self: *const DelimitedSource, f: Field) []const u8 {
+        return self.text_buf.items[f.start..f.end];
     }
 
     fn parseHeader(self: *DelimitedSource) !void {
         self.header_parsed = true;
         if (!self.use_header) return;
         if (self.col_names != null) return; // explicit cols take precedence
-
-        const line = try self.readLine() orelse return;
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (trimmed.len == 0) return;
+        if (!try self.readRecord()) return;
 
         var names = std.array_list.Managed([]const u8).init(self.allocator);
         errdefer {
             for (names.items) |n| self.allocator.free(n);
             names.deinit();
         }
-
-        var it = std.mem.splitScalar(u8, trimmed, self.delimiter);
-        while (it.next()) |col| {
-            const name = std.mem.trim(u8, col, " \t\"");
-            try names.append(try self.allocator.dupe(u8, name));
+        for (self.fields.items) |f| {
+            try names.append(try self.allocator.dupe(u8, self.fieldText(f)));
         }
 
         self.col_names = try names.toOwnedSlice();
@@ -227,45 +313,67 @@ pub const DelimitedSource = struct {
             try self.parseHeader();
         }
 
-        while (true) {
-            const raw_line = try self.readLine() orelse return null;
-            const trimmed = std.mem.trimEnd(u8, raw_line, "\r");
-            if (trimmed.len == 0) continue;
+        if (!try self.readRecord()) return null;
+        self.line_num += 1;
 
-            self.line_num += 1;
+        var rec = Record.init(self.allocator);
+        errdefer rec.deinit();
 
-            var rec = Record.init(self.allocator);
-            errdefer rec.deinit();
+        for (self.fields.items, 0..) |f, col_idx| {
+            const col = self.fieldText(f);
+            const key = try self.getColName(col_idx);
+            errdefer self.allocator.free(key);
 
-            var col_idx: usize = 0;
-            var it = std.mem.splitScalar(u8, trimmed, self.delimiter);
-            while (it.next()) |col_raw| {
-                const col = std.mem.trim(u8, col_raw, " \t");
-                const key = try self.getColName(col_idx);
-                errdefer self.allocator.free(key);
+            // Numbers are inferred from the text; an empty unquoted cell is null.
+            const val: OwnedValue = if (col.len == 0 and !f.quoted)
+                .null_val
+            else if (parseNumber(col)) |n|
+                // Keep the exact digits only when they are valid JSON (not "007", "+5").
+                .{ .number = if (isJsonNumber(col)) try Number.fromLiteral(self.allocator, n, col) else Number.of(n) }
+            else
+                .{ .string = try self.allocator.dupe(u8, col) };
+            errdefer val.deinit(self.allocator);
 
-                // Try to parse as number, otherwise string
-                const val: OwnedValue = if (col.len > 0)
-                    if (std.fmt.parseFloat(f64, col)) |n|
-                        OwnedValue{ .number = n }
-                    else |_|
-                        OwnedValue{ .string = try self.allocator.dupe(u8, col) }
-                else
-                    OwnedValue.null_val;
-
-                try rec.fields.put(self.allocator, key, val);
-                col_idx += 1;
-            }
-
-            // Add line number
-            const n_key = try self.allocator.dupe(u8, "_n");
-            errdefer self.allocator.free(n_key);
-            try rec.fields.put(self.allocator, n_key, OwnedValue{ .number = @floatFromInt(self.line_num) });
-
-            return rec;
+            try rec.fields.put(self.allocator, key, val);
         }
+
+        // Add line number
+        const n_key = try self.allocator.dupe(u8, "_n");
+        errdefer self.allocator.free(n_key);
+        try rec.fields.put(self.allocator, n_key, OwnedValue.num(@floatFromInt(self.line_num)));
+
+        return rec;
     }
 };
+
+/// The value of a plain decimal number cell, else null.
+fn parseNumber(s: []const u8) ?f64 {
+    if (!looksNumeric(s)) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
+/// A plain decimal number: optional sign, digits with an optional fraction,
+/// optional exponent. Unlike std.fmt.parseFloat this rejects "nan", "inf",
+/// hex and digit separators, which in a CSV cell are text.
+fn looksNumeric(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+    var digits: usize = 0;
+    while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) digits += 1;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) digits += 1;
+    }
+    if (digits == 0) return false;
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        const exp_start = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == exp_start) return false;
+    }
+    return i == s.len;
+}
 
 // ─── TESTS ───────────────────────────────────────────────────────────────────
 
@@ -281,13 +389,13 @@ test "TextLineSource: basic line reading" {
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
     try std.testing.expectEqualStrings("hello world", rec1.get("line").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rec1.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rec1.get("_n").?.number.f, 0.01);
 
     // Second line
     var rec2 = (try src.next()).?;
     defer rec2.deinit();
     try std.testing.expectEqualStrings("goodbye world", rec2.get("line").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rec2.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rec2.get("_n").?.number.f, 0.01);
 
     // EOF
     try std.testing.expect(try src.next() == null);
@@ -304,12 +412,12 @@ test "TextLineSource: skips blank lines" {
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
     try std.testing.expectEqualStrings("first", rec1.get("line").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rec1.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rec1.get("_n").?.number.f, 0.01);
 
     var rec2 = (try src.next()).?;
     defer rec2.deinit();
     try std.testing.expectEqualStrings("second", rec2.get("line").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rec2.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rec2.get("_n").?.number.f, 0.01);
 
     try std.testing.expect(try src.next() == null);
 }
@@ -371,14 +479,14 @@ test "DelimitedSource: CSV with header" {
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
     try std.testing.expectEqualStrings("Alice", rec1.get("name").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("age").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("age").?.number.f, 0.01);
     try std.testing.expectEqualStrings("Austin", rec1.get("city").?.string);
 
     // Second data row
     var rec2 = (try src.next()).?;
     defer rec2.deinit();
     try std.testing.expectEqualStrings("Bob", rec2.get("name").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 25.0), rec2.get("age").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 25.0), rec2.get("age").?.number.f, 0.01);
     try std.testing.expectEqualStrings("Boston", rec2.get("city").?.string);
 
     try std.testing.expect(try src.next() == null);
@@ -395,7 +503,7 @@ test "DelimitedSource: auto-numbered columns without header" {
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
     try std.testing.expectEqualStrings("Alice", rec1.get("f1").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("f2").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("f2").?.number.f, 0.01);
     try std.testing.expectEqualStrings("Austin", rec1.get("f3").?.string);
 
     var rec2 = (try src.next()).?;
@@ -417,7 +525,7 @@ test "DelimitedSource: explicit column names" {
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
     try std.testing.expectEqualStrings("Alice", rec1.get("person").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("years").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("years").?.number.f, 0.01);
 
     var rec2 = (try src.next()).?;
     rec2.deinit();
@@ -435,7 +543,7 @@ test "DelimitedSource: TSV tab-separated" {
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
     try std.testing.expectEqualStrings("Alice", rec1.get("name").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("age").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 30.0), rec1.get("age").?.number.f, 0.01);
 
     var rec2 = (try src.next()).?;
     rec2.deinit();
@@ -454,12 +562,12 @@ test "DelimitedSource: pipe-separated" {
     defer rec1.deinit();
     try std.testing.expectEqualStrings("web1", rec1.get("host").?.string);
     try std.testing.expectEqualStrings("ok", rec1.get("status").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 200.0), rec1.get("code").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 200.0), rec1.get("code").?.number.f, 0.01);
 
     var rec2 = (try src.next()).?;
     defer rec2.deinit();
     try std.testing.expectEqualStrings("web2", rec2.get("host").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 500.0), rec2.get("code").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 500.0), rec2.get("code").?.number.f, 0.01);
 
     try std.testing.expect(try src.next() == null);
 }
@@ -508,9 +616,9 @@ test "DelimitedSource: numeric parsing" {
 
     var rec = (try src.next()).?;
     defer rec.deinit();
-    try std.testing.expectApproxEqAbs(@as(f64, 42.0), rec.get("f1").?.number, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.14), rec.get("f2").?.number, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f64, -7.0), rec.get("f3").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 42.0), rec.get("f1").?.number.f, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), rec.get("f2").?.number.f, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, -7.0), rec.get("f3").?.number.f, 0.01);
     try std.testing.expectEqualStrings("hello", rec.get("f4").?.string);
 }
 
@@ -524,13 +632,13 @@ test "DelimitedSource: has _n line number" {
 
     var rec1 = (try src.next()).?;
     defer rec1.deinit();
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rec1.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rec1.get("_n").?.number.f, 0.01);
 
     var rec2 = (try src.next()).?;
     defer rec2.deinit();
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rec2.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rec2.get("_n").?.number.f, 0.01);
 
     var rec3 = (try src.next()).?;
     defer rec3.deinit();
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), rec3.get("_n").?.number, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), rec3.get("_n").?.number.f, 0.01);
 }
