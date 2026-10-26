@@ -1121,6 +1121,23 @@ fn fuzzScanner(_: void, smith: *std.testing.Smith) anyerror!void {
     const one_value = accepted and values == 1;
     try std.testing.expectEqual(one_value, isValidJson(input));
 
+    // NDJSON mode with line recovery must always make progress and finish.
+    var r2 = std.Io.Reader.fixed(input);
+    var nd = try Scanner.init(std.testing.allocator, &r2);
+    defer nd.deinit();
+    nd.allow_top_level_commas = true;
+    nd.split_records_at_col0 = true;
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps > 4 * input.len + 8) return error.TestUnexpectedResult; // no progress
+        const ev = nd.next() catch |err| {
+            if (!isSyntaxError(err)) return err;
+            try nd.recoverAtLine();
+            continue;
+        };
+        if (ev == .end_of_input) break;
+    }
+
     for (input) |b| if (b >= 0x80) return;
     if (std.ascii.findIgnoreCase(input, "\\ud") != null) return;
     const std_ok = std.json.validate(std.testing.allocator, input) catch false;
