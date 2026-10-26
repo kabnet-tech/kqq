@@ -139,13 +139,14 @@ pub const DelimitedSource = struct {
     header_parsed: bool = false,
     use_header: bool,
     line_buf: std.array_list.Managed(u8),
-    /// A record that spans lines (a quoted field containing newlines).
-    record_buf: std.array_list.Managed(u8),
     /// Decoded field text of the current record, and each field's span in it.
     text_buf: std.array_list.Managed(u8),
     fields: std.array_list.Managed(Field),
     line_num: usize = 0,
     done: bool = false,
+    /// Set when input ended inside a quoted field: the record number (`_n`)
+    /// whose last field ran to the end of the input. The caller warns.
+    unterminated_record: ?usize = null,
 
     const Field = struct { start: usize, end: usize, quoted: bool };
 
@@ -163,7 +164,6 @@ pub const DelimitedSource = struct {
             .col_names = if (explicit_cols) |ec| @constCast(ec) else null,
             .use_header = use_header,
             .line_buf = std.array_list.Managed(u8).init(allocator),
-            .record_buf = std.array_list.Managed(u8).init(allocator),
             .text_buf = std.array_list.Managed(u8).init(allocator),
             .fields = std.array_list.Managed(Field).init(allocator),
         };
@@ -177,7 +177,6 @@ pub const DelimitedSource = struct {
             }
         }
         self.line_buf.deinit();
-        self.record_buf.deinit();
         self.text_buf.deinit();
         self.fields.deinit();
     }
@@ -192,16 +191,14 @@ pub const DelimitedSource = struct {
             };
             const line = std.mem.trimEnd(u8, first, "\r");
             if (line.len == 0) continue;
-            if (!try self.splitFields(line)) {
+            if (!try self.splitFields(line, false)) {
                 // A quoted field is still open: the record continues on the
-                // next line(s), joined by the newline the line split removed.
-                // (At end of input the unterminated field keeps what it has.)
-                self.record_buf.clearRetainingCapacity();
-                try self.record_buf.appendSlice(line);
+                // next line(s). Each line is scanned once, continuing the field.
                 while (try readLine(self.reader, &self.line_buf)) |more| {
-                    try self.record_buf.append('\n');
-                    try self.record_buf.appendSlice(std.mem.trimEnd(u8, more, "\r"));
-                    if (try self.splitFields(self.record_buf.items)) break;
+                    if (try self.splitFields(std.mem.trimEnd(u8, more, "\r"), true)) break;
+                } else {
+                    // End of input inside quotes: the field keeps what it has.
+                    self.unterminated_record = self.line_num + 1;
                 }
             }
             return true;
@@ -212,19 +209,35 @@ pub const DelimitedSource = struct {
         return (c == ' ' or c == '\t') and c != self.delimiter;
     }
 
-    /// Split `line` into decoded fields. Returns false when it ends inside a
-    /// quoted field (that last field then holds the text read so far).
-    fn splitFields(self: *DelimitedSource, line: []const u8) !bool {
-        self.fields.clearRetainingCapacity();
-        self.text_buf.clearRetainingCapacity();
+    /// Split `line` into decoded fields. With `continuing`, `line` continues
+    /// the quoted field the previous line left open (a newline joins them).
+    /// Returns false when `line` ends inside a quoted field; that last field
+    /// then holds the text read so far.
+    fn splitFields(self: *DelimitedSource, line: []const u8, continuing: bool) !bool {
         var i: usize = 0;
+        var resume_quoted = false;
+        var resume_start: usize = 0;
+        if (continuing) {
+            resume_start = self.fields.pop().?.start; // the open field
+            try self.text_buf.append('\n');
+            resume_quoted = true;
+        } else {
+            self.fields.clearRetainingCapacity();
+            self.text_buf.clearRetainingCapacity();
+        }
         while (true) {
-            while (i < line.len and self.isPad(line[i])) i += 1;
-            const start = self.text_buf.items.len;
-            var quoted = false;
-            if (i < line.len and line[i] == '"') {
-                quoted = true;
-                i += 1;
+            var start = resume_start;
+            var quoted = resume_quoted;
+            if (!resume_quoted) {
+                while (i < line.len and self.isPad(line[i])) i += 1;
+                start = self.text_buf.items.len;
+                if (i < line.len and line[i] == '"') {
+                    quoted = true;
+                    i += 1;
+                }
+            }
+            resume_quoted = false;
+            if (quoted) {
                 while (true) {
                     if (i >= line.len) {
                         // still inside quotes

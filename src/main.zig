@@ -796,6 +796,8 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 _ = kqq_stream_exec.execGenericSource(allocator, &src, q, primary_out, opts) catch |err| dieErr(err);
             }
+            if (src.unterminated_record) |n|
+                warn("record {d}: quoted field never closed; it runs to the end of the input", .{n});
         }
         try primary_out.flush();
         return;

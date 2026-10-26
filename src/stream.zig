@@ -107,6 +107,14 @@ pub const Scanner = struct {
     /// Nothing but whitespace containing a newline has been consumed since the
     /// last token. Tells `recoverAtLine` whether the offending byte starts a line.
     line_start: bool = true,
+    /// The last byte consumed was a newline (or nothing was consumed yet).
+    col0: bool = true,
+    /// Newline-delimited records: while an object is open, a line starting
+    /// with '{' in column 0 is a new record, so the open one was truncated
+    /// (`{"a":[` + newline + `{"b":1}`) — an error rather than a nested value.
+    /// Pretty-printers indent nested values, so valid multi-line records
+    /// never trip this.
+    split_records_at_col0: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Self {
         const buf = try allocator.alloc(u8, INIT_STR_BUF);
@@ -141,6 +149,7 @@ pub const Scanner = struct {
     fn consume(self: *Self, n: usize) void {
         self.reader.toss(n);
         self.line_start = false;
+        self.col0 = false;
     }
 
     /// All buffered bytes (at least one), or null at end of input.
@@ -151,13 +160,23 @@ pub const Scanner = struct {
         };
     }
 
-    fn skipWs(self: *Self) !void {
+    inline fn skipWs(self: *Self) !void {
+        // Fast path: usually a token follows directly.
+        const r = self.reader;
+        if (r.seek < r.end and r.buffer[r.seek] > ' ') return;
+        return self.skipWsSlow();
+    }
+
+    fn skipWsSlow(self: *Self) !void {
         const r = self.reader;
         while (true) {
             while (r.seek < r.end) : (r.seek += 1) {
                 switch (r.buffer[r.seek]) {
-                    ' ', '\t', '\r' => {},
-                    '\n' => self.line_start = true,
+                    ' ', '\t', '\r' => self.col0 = false,
+                    '\n' => {
+                        self.line_start = true;
+                        self.col0 = true;
+                    },
                     else => return,
                 }
             }
@@ -166,6 +185,10 @@ pub const Scanner = struct {
                 else => |e| return e,
             };
         }
+    }
+
+    fn inObject(self: *const Self) bool {
+        return std.mem.indexOfScalar(bool, self.stack.items, true) != null;
     }
 
     /// True if reaching the next non-whitespace byte would need a refill
@@ -473,6 +496,8 @@ pub const Scanner = struct {
                 },
                 .value, .value_or_end => {
                     if (c == ']' and self.state == .value_or_end) return self.close();
+                    if (c == '{' and self.col0 and self.split_records_at_col0 and self.inObject())
+                        return error.BadJson; // left unconsumed: the new record starts here
                     if (c == ',' and self.stack.items.len == 0 and
                         self.allow_top_level_commas and self.top_value_done)
                     {
@@ -530,6 +555,7 @@ pub const Scanner = struct {
         self.state = .value;
         self.top_value_done = false;
         self.line_start = true;
+        self.col0 = true;
     }
 
     /// Skip one complete JSON value (object, array, or scalar).
@@ -993,6 +1019,34 @@ test "atLineEnd rejects trailing garbage after a top-level value" {
         if (!w) try sc.recoverAtLine();
     }
     try std.testing.expect((try sc.next()) == .end_of_input);
+}
+
+test "split_records_at_col0: a column-0 '{' inside an open record starts a new one" {
+    // Regression: a record cut off after `[` (or `:` / `,`) used to absorb the
+    // next line's complete record as a nested value.
+    var r = std.Io.Reader.fixed("{\"a\":1}\n{\"a\":2,\"t\":[\n{\"a\":3}\n{\"a\":4,\n  \"o\": {\"b\": [\n    {\"c\": 5}\n  ]}\n}\n");
+    var sc = try Scanner.init(std.testing.allocator, &r);
+    defer sc.deinit();
+    sc.split_records_at_col0 = true;
+    var tops = std.array_list.Managed(f64).init(std.testing.allocator);
+    defer tops.deinit();
+    var errors: usize = 0;
+    while (true) {
+        const ev = sc.next() catch |err| {
+            try std.testing.expect(isSyntaxError(err));
+            errors += 1;
+            try sc.recoverAtLine();
+            continue;
+        };
+        switch (ev) {
+            .end_of_input => break,
+            .number => |n| if (sc.depth() == 1) try tops.append(n.value),
+            else => {},
+        }
+    }
+    // 2 starts the truncated record; 3 and the indented multi-line record 4 survive.
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3, 4 }, tops.items);
+    try std.testing.expectEqual(@as(usize, 1), errors);
 }
 
 test "top-level commas only when allowed" {

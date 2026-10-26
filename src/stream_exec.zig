@@ -194,7 +194,8 @@ fn projectRecord(
             // An expression that cannot be evaluated (missing field, type
             // mismatch) is SQL NULL: the column is still emitted, as `null`.
             const val = evalExpr(allocator, src, e) orelse .null_val;
-            try out.fields.put(allocator, out_key, val);
+            errdefer val.deinit(allocator);
+            try out.putOwned(out_key, val);
             continue;
         }
         const ov_opt = src.get(f.key);
@@ -213,7 +214,8 @@ fn projectRecord(
         const out_key = try allocator.dupe(u8, raw_key);
         errdefer allocator.free(out_key);
         const out_val = try ov.copy(allocator);
-        try out.fields.put(allocator, out_key, out_val);
+        errdefer out_val.deinit(allocator);
+        try out.putOwned(out_key, out_val);
     }
     return out;
 }
@@ -450,6 +452,12 @@ fn collectRawArray(sc: anytype, raw_buf: *std.array_list.Managed(u8)) !void {
     }
 }
 
+/// Consume the rest of a container whose opening event was just returned.
+fn skipOpened(sc: *stream.Scanner) !void {
+    const d = sc.depth();
+    while (sc.depth() >= d) _ = try sc.next();
+}
+
 // ─── Navigate to target array in the stream ──────────────────────────────────
 //
 // Consumes events until we've descended into the array identified by `path`.
@@ -565,6 +573,7 @@ pub fn execStream(
         const ev = try sc.next();
         switch (ev) {
             .array_end, .end_of_input => break :array_loop,
+            .array_start => try skipOpened(&sc), // a nested array is not a record
             .object_start => {
                 _ = scratch.reset(.retain_capacity);
                 var rec = try collectRecord(scratch.allocator(), &sc);
@@ -883,13 +892,14 @@ pub fn execStreamNDJSON(
         }
 
         // Skip lines that don't start an object (arrays, bare values, comments)
-        if (trimmed[0] != '{') continue :ndjson_loop;
+        const content = std.mem.trimStart(u8, trimmed, " \t");
+        if (content[0] != '{') continue :ndjson_loop;
 
         // A JSON array written one element per line leaves a trailing comma.
-        const line = if (trimmed[trimmed.len - 1] == ',')
-            std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - 1], " \t")
+        const line = if (content[content.len - 1] == ',')
+            std.mem.trimEnd(u8, content[0 .. content.len - 1], " \t")
         else
-            trimmed;
+            content;
 
         // ── Raw-byte fast path ────────────────────────────────────────────────
         // Attempt WHERE evaluation directly on raw bytes before any parsing.
@@ -1090,7 +1100,7 @@ const AggAccum = struct {
             const agg = f.agg orelse continue;
             const name = try allocator.dupe(u8, if (f.alias) |a| a else f.key);
             errdefer allocator.free(name);
-            try rec.fields.put(allocator, name, self.result(i, agg));
+            try rec.putOwned(name, self.result(i, agg));
             i += 1;
         }
     }
@@ -1370,6 +1380,7 @@ const ScopedIter = struct {
                     self.done = true;
                     return null;
                 },
+                .array_start => try skipOpened(self.sc), // a nested array is not a record
                 .object_start => {
                     _ = self.scratch_arena.reset(.retain_capacity);
                     const rec = try collectRecord(self.scratch_arena.allocator(), self.sc);
@@ -1394,6 +1405,7 @@ pub fn execGroupByNDJSON(
     var sc = try stream.Scanner.init(allocator, reader);
     defer sc.deinit();
     sc.allow_top_level_commas = true;
+    sc.split_records_at_col0 = true;
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
 
@@ -1500,6 +1512,7 @@ pub fn execGlobalAggNDJSON(
     var sc = try stream.Scanner.init(allocator, reader);
     defer sc.deinit();
     sc.allow_top_level_commas = true;
+    sc.split_records_at_col0 = true;
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
 
@@ -1635,31 +1648,18 @@ pub fn execLlmStream(
         // Try to extract complete JSON objects from the accumulator.
         // Strategy: scan for brace/bracket depth, handling quoted strings.
         while (extractNextObject(accum.items)) |obj_span| {
-            const obj_bytes = accum.items[obj_span.start..obj_span.end];
+            // Take the object out of the accumulator first: draining shifts
+            // the buffer, and --reject below writes these bytes.
+            _ = scratch.reset(.retain_capacity);
+            const obj_bytes = try scratch.allocator().dupe(u8, accum.items[obj_span.start..obj_span.end]);
+            drainAccum(&accum, obj_span.end);
 
             // Parse the extracted object and run the query against it
-            _ = scratch.reset(.retain_capacity);
             var obj_reader = std.Io.Reader.fixed(obj_bytes);
-            var obj_sc = stream.Scanner.init(scratch.allocator(), &obj_reader) catch {
-                drainAccum(&accum, obj_span.end);
-                continue;
-            };
-            const obj_ev = obj_sc.next() catch {
-                drainAccum(&accum, obj_span.end);
-                continue;
-            };
-            if (obj_ev != .object_start) {
-                drainAccum(&accum, obj_span.end);
-                continue;
-            }
-
-            var rec = collectRecord(scratch.allocator(), &obj_sc) catch {
-                drainAccum(&accum, obj_span.end);
-                continue;
-            };
-
-            // Drain the consumed bytes from the accumulator
-            drainAccum(&accum, obj_span.end);
+            var obj_sc = stream.Scanner.init(scratch.allocator(), &obj_reader) catch continue;
+            const obj_ev = obj_sc.next() catch continue;
+            if (obj_ev != .object_start) continue;
+            var rec = collectRecord(scratch.allocator(), &obj_sc) catch continue;
 
             // Schema validation (--expect)
             if (opts.expect_schema) |schema| {

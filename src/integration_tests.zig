@@ -4044,3 +4044,94 @@ test "review: parse errors free everything (no leaks)" {
         } else |_| {}
     }
 }
+
+// ─── Follow-ups from an independent review of the fixes above ────────────────
+
+test "review#2: a record truncated after '[' does not swallow the next line" {
+    const allocator = std.testing.allocator;
+    const data = "{\"a\":1}\n{\"a\":2,\"t\":[\n{\"a\":3}\n{\"a\":4}\n";
+    for ([_][]const u8{ "select count(), sum(a)", "select a, count() group by a order by a" }, [_][]const u8{
+        "{\"count\": 3, \"sum\": 8}\n",
+        "{\"a\": 1, \"count\": 1}\n{\"a\": 3, \"count\": 1}\n{\"a\": 4, \"count\": 1}\n",
+    }) |q, want| {
+        var skipped: usize = 0;
+        var opts = ndjson_opts;
+        opts.skipped_records = &skipped;
+        const result = try runNDJSON(allocator, data, q, opts);
+        defer allocator.free(result.out);
+        try std.testing.expectEqualStrings(want, result.out);
+        try std.testing.expectEqual(@as(usize, 1), skipped);
+    }
+    // A pretty-printed (indented) multi-line record still reads as one record.
+    try expectNdjson("{\"a\": 1,\n  \"o\": {\n    \"b\": [\n      {\"c\": 2}\n    ]\n  }\n}\n{\"a\": 2}\n", "select count(), sum(a)", "{\"count\": 2, \"sum\": 3}\n");
+}
+
+test "review#2: indented NDJSON lines are records in every path" {
+    try expectNdjson("  {\"a\":1}\n\t{\"a\":2}", "select a", "{\"a\": 1}\n{\"a\": 2}\n");
+    try expectNdjson("  {\"a\":1}\n\t{\"a\":2}", "select count()", "{\"count\": 2}\n");
+}
+
+test "review#1: a leading number is a literal, not a field name" {
+    try expectNdjson("{\"name\":\"x\",\"sal\":200}", "select name, 2 + len(name) as l, 7 as seven where 2 * sal > 300", "{\"name\": \"x\", \"l\": 3, \"seven\": 7}\n");
+    try expectNdjson("{\"sal\":100}", "select sal where 2 * sal > 300", "");
+}
+
+test "review#1: capitalised keyword-named fields stay fields" {
+    // Only the lowercase `count` shorthand (no parentheses) means count().
+    try expectNdjson("{\"name\":\"x\",\"Count\":9}\n{\"name\":\"y\",\"Count\":1}", "select name, Count where Count > 8", "{\"name\": \"x\", \"Count\": 9}\n");
+    try expectNdjson("{\"Count\":9}", "select COUNT(*) as n, Count(Count) as m", "{\"n\": 1, \"m\": 1}\n");
+}
+
+test "review#6: unaliased aggregates get distinct column names" {
+    try expectNdjson("{\"d\":\"x\",\"n\":1}\n{\"d\":\"x\"}", "select d, count(), count(n), sum(n), sum(n * 2) group by d", "{\"d\": \"x\", \"count\": 2, \"count_n\": 1, \"sum\": 1, \"sum_5\": 2}\n");
+    // Explicit duplicate aliases: the last column wins (and nothing leaks).
+    try expectNdjson("{\"n\":1}", "select count() as c, sum(n) as c", "{\"c\": 1}\n");
+    try expectNdjson("{\"a\":1,\"b\":2}", "select a, b as a", "{\"a\": 2}\n");
+}
+
+test "review#7: scoped mode skips nested arrays inside the scope array" {
+    const allocator = std.testing.allocator;
+    const doc = "{\"x\":[{\"a\":1},[{\"a\":9}],{\"a\":2},3,\"s\"]}";
+    const rows = try runScoped(allocator, doc, "[x.*] select a", ndjson_opts);
+    defer allocator.free(rows.out);
+    try std.testing.expectEqualStrings("{\"a\": 1}\n{\"a\": 2}\n", rows.out);
+    const agg = try runScoped(allocator, doc, "[x.*] select count(), sum(a)", ndjson_opts);
+    defer allocator.free(agg.out);
+    try std.testing.expectEqualStrings("{\"count\": 2, \"sum\": 3}\n", agg.out);
+}
+
+test "review#3: a stray quote in CSV is linear, warns, and keeps the text" {
+    const allocator = std.testing.allocator;
+    var input = std.array_list.Managed(u8).init(allocator);
+    defer input.deinit();
+    try input.appendSlice("h,n\n\"oops,1\n");
+    for (0..20_000) |i| try input.print("r{d},{d}\n", .{ i, i });
+    var r = std.Io.Reader.fixed(input.items);
+    var src = record_source.DelimitedSource.init(allocator, &r, ',', true, null);
+    defer src.deinit();
+    var rows: usize = 0;
+    while (try src.next()) |rec_val| {
+        var rec = rec_val;
+        defer rec.deinit();
+        rows += 1;
+        // RFC 4180: the open quote runs to the end of the input.
+        try std.testing.expect(std.mem.endsWith(u8, rec.get("h").?.string, "r19999,19999"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    try std.testing.expectEqual(@as(?usize, 1), src.unterminated_record);
+}
+
+test "review#2: --llm --reject writes the rejected object intact" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{"response":"{\"make\":\"Ford\",\"price\":10}{\"make\":\"BMW\","}
+        \\{"response":"\"price\":20}"}
+        \\
+    ;
+    var reject = std.Io.Writer.Allocating.init(allocator);
+    defer reject.deinit();
+    const result = try runLLM(allocator, input, "select make where price > 15", .{ .format = .ndjson, .llm_field = "response", .reject_writer = &reject.writer });
+    defer allocator.free(result.out);
+    try std.testing.expectEqualStrings("{\"make\": \"BMW\"}\n", result.out);
+    try std.testing.expectEqualStrings("{\"make\":\"Ford\",\"price\":10}\n", reject.written());
+}

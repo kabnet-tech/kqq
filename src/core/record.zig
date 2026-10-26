@@ -137,6 +137,17 @@ pub const Record = struct {
         self.fields.deinit(self.allocator);
     }
 
+    /// Insert an owned key/value. If the key is already present (two output
+    /// columns with one name) the new value wins and nothing leaks.
+    pub fn putOwned(self: *Record, key: []u8, val: OwnedValue) !void {
+        const gop = try self.fields.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            gop.value_ptr.deinit(self.allocator);
+        }
+        gop.value_ptr.* = val;
+    }
+
     /// Look up a field by name.  Query field names use '.' as the path separator
     /// (e.g. "address.city") but internal hashmap keys use PATH_SEP ('\x1f').
     /// Strategy:

@@ -328,6 +328,12 @@ fn parseCall(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, name: F
     return node;
 }
 
+/// The tag of the token after `cur`, without consuming anything.
+fn peekTag(tok: *const Tokenizer) ParseError!TokTag {
+    var t = tok.*;
+    return (try t.next()).tag;
+}
+
 /// Resolve `name(` to a function, or fail with UnknownFunction pointing at the name.
 fn lookupFunction(tok: *Tokenizer, name_tok: Token) ParseError!FuncName {
     return funcNameFromStr(name_tok.text) orelse {
@@ -702,12 +708,11 @@ fn parseWherePrimary(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token)
         // fall through — NOT IN / NOT CONTAINS / NOT MATCHES handled in parseConditionBody
     }
 
-    // A call (`len(name) > 5`, `ifhas(...)`) is a computed LHS. A function
-    // keyword not followed by '(' is a plain field name (`where keys = "x"`).
-    if (isFuncKeyword(cur.tag) != null or cur.tag == .ident) {
-        var tok_peek = tok.*;
-        const peek = tok_peek.next() catch return error.UnexpectedToken;
-        if (peek.tag == .lparen) {
+    // A call (`len(name) > 5`, `ifhas(...)`) or a leading literal
+    // (`2 * price > 300`) is a computed LHS. A function keyword not followed
+    // by '(' is a plain field name (`where keys = "x"`).
+    if (cur.tag == .number or isFuncKeyword(cur.tag) != null or cur.tag == .ident) {
+        if (cur.tag == .number or (try peekTag(tok)) == .lparen) {
             const e = try parseExpr(allocator, tok, cur);
             const k = allocator.dupe(u8, "__expr__") catch {
                 destroyExpr(allocator, e);
@@ -1133,7 +1138,45 @@ fn parseSelectList(allocator: std.mem.Allocator, tok: *Tokenizer, cur: *Token, q
             cur.* = try tok.next();
         }
     }
+    try dedupeAggNames(allocator, list.items);
     q.fields = try list.toOwnedSlice();
+}
+
+fn outputName(f: SelectField) []const u8 {
+    return f.alias orelse f.key;
+}
+
+fn nameTaken(fields: []const SelectField, name: []const u8) bool {
+    for (fields) |f| {
+        if (std.mem.eql(u8, outputName(f), name)) return true;
+    }
+    return false;
+}
+
+/// Unaliased aggregates are named after their function, so `count(), count(n)`
+/// or `sum(a), sum(b)` would share one output column. Rename the later ones
+/// after their field (`count_n`, `sum_b`), or their position (`sum_3`).
+fn dedupeAggNames(allocator: std.mem.Allocator, fields: []SelectField) ParseError!void {
+    for (fields, 0..) |*f, i| {
+        const agg = f.agg orelse continue;
+        const default: []const u8 = if (agg == .count_rows) "count" else @tagName(agg);
+        const name = f.alias orelse continue;
+        if (!std.mem.eql(u8, name, default) or !nameTaken(fields[0..i], name)) continue;
+        var renamed = if (f.expr == null and agg != .count_rows)
+            try std.fmt.allocPrint(allocator, "{s}_{s}", .{ default, f.key })
+        else
+            try std.fmt.allocPrint(allocator, "{s}_{d}", .{ default, i + 1 });
+        if (nameTaken(fields[0..i], renamed)) {
+            const by_position = std.fmt.allocPrint(allocator, "{s}_{d}", .{ renamed, i + 1 }) catch |e| {
+                allocator.free(renamed);
+                return e;
+            };
+            allocator.free(renamed);
+            renamed = by_position;
+        }
+        allocator.free(name);
+        f.alias = renamed;
+    }
 }
 
 /// One SELECT item (or the operand of `* add`, when `is_add`).
@@ -1144,8 +1187,12 @@ fn parseSelectItem(
     has_count: *bool,
     is_add: bool,
 ) ParseError!SelectField {
-    // count / count() / count(*): rows; count(expr): non-null values of expr
-    if (cur.tag == .kw_count and !is_add) {
+    // count / count() / count(*): rows; count(expr): non-null values of expr.
+    // Without parentheses only the lowercase shorthand `count` counts rows:
+    // `Count` or `COUNT` alone is a field name (keywords are otherwise case-insensitive).
+    if (cur.tag == .kw_count and !is_add and
+        (std.mem.eql(u8, cur.text, "count") or (try peekTag(tok)) == .lparen))
+    {
         cur.* = try tok.next();
         var arg: ?AggArg = null;
         if (cur.tag == .lparen) {
@@ -1221,7 +1268,7 @@ fn parseSelectItem(
     }
 
     // Computed column starting with CASE or a literal: alias required.
-    if (cur.tag == .kw_case or cur.tag == .string or cur.tag == .lparen) {
+    if (cur.tag == .kw_case or cur.tag == .string or cur.tag == .number or cur.tag == .lparen) {
         const e = try parseExpr(allocator, tok, cur);
         errdefer destroyExpr(allocator, e);
         return computedField(allocator, tok, cur, e, is_add);

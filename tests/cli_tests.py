@@ -898,6 +898,35 @@ check("review#8 a % 0 is null (valid JSON, no -nan)",
       args=['select a % 0 as m'], stdin=b'{"a":1}\n',
       stdout_records=[{"m": None}])
 
+# Follow-ups from an independent review of the fixes above.
+check("review#2 record truncated after '[' keeps the next line (aggregates)",
+      args=['select count(), sum(a)'], stdin=b'{"a":1}\n{"a":2,"t":[\n{"a":3}\n{"a":4}\n',
+      stdout_records=[{"count": 3, "sum": 8}], stderr_contains="1 record(s) skipped")
+
+check("review#2 indented NDJSON lines are records",
+      args=['select a'], stdin=b'  {"a":1}\n\t{"a":2}\n',
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+check("review#1 leading number is a literal",
+      args=['select name where 2 * sal > 300'], stdin=b'{"name":"x","sal":200}\n',
+      stdout_records=[{"name": "x"}])
+
+check("review#1 capitalised Count is a field",
+      args=['select name, Count where Count > 8'], stdin=b'{"name":"x","Count":9}\n',
+      stdout_records=[{"name": "x", "Count": 9}])
+
+check("review#6 unaliased aggregates get distinct names",
+      args=['select d, count(), count(n) group by d'], stdin=b'{"d":"x","n":1}\n{"d":"x"}\n',
+      stdout_records=[{"d": "x", "count": 2, "count_n": 1}])
+
+check("review#7 scoped mode skips nested arrays",
+      args=['[x.*] select a'], stdin=b'{"x":[{"a":1},[{"a":9}],{"a":2}]}',
+      stdout_records=[{"a": 1}, {"a": 2}])
+
+check("review#3 unterminated CSV quote warns",
+      args=['--delim', ',', '--header', 'select count()'], stdin=b'h,n\n"oops,1\nr,2\n',
+      stdout_records=[{"count": 1}], stderr_contains="quoted field never closed")
+
 # ─── No-input TTY guard ───────────────────────────────────────────────────────
 # We can't easily fake a TTY in subprocess, so we skip that path.
 # It's tested implicitly by the fact that all other tests pipe stdin.

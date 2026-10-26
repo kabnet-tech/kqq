@@ -19,7 +19,11 @@ they may come in any order, each at most once (`group by` may also precede
 records.
 
 Keywords and function names are case-insensitive (`SELECT`, `Where`,
-`ORDER BY`, `Upper(...)`); field names are case-sensitive, like JSON keys.
+`ORDER BY`, `Upper(...)`); field names are case-sensitive, like JSON keys,
+and a keyword can be used as a field name (`select type, desc`). The one
+exception: lowercase `count` without parentheses is shorthand for `count()`;
+`Count` or `COUNT` alone is a field. A number in an expression is a literal
+(`select 2 * price as p`, `where 2 * price > 300`).
 Every token must be understood: anything left over — a misspelled clause, a
 missing comma, an unknown function — is a parse error (exit 1), never
 silently ignored.
@@ -136,7 +140,8 @@ cat logs.ndjson | kqq 'select service, count() as n, avg(latency_ms) as p50 grou
 Aggregates skip null and missing values (`count()` excepted), and their
 argument may be any expression: `sum(price * qty)`, `max(len(name))`.
 Without `as`, an aggregate column is named after the function (`sum`,
-`count`, ...). Aggregate columns appear in SELECT order, after the group keys;
+`count`, ...); when two would share a name, the later one takes its field's
+name or its position as a suffix (`count(), count(n)` → `count`, `count_n`). Aggregate columns appear in SELECT order, after the group keys;
 group keys are always included. `stddev` and `variance` are the population
 forms (DuckDB `stddev_pop` / `var_pop`).
 
@@ -305,14 +310,20 @@ kqq "select a into '/tmp/out.json'"
 JSON input is parsed strictly (RFC 8259). In NDJSON input a malformed or
 truncated record — `{"a":2,,}`, a missing closing brace — is skipped and
 reading resumes with the next line; kqq exits 0 and prints
-`kqq: warning: N record(s) skipped (malformed JSON)`. A single JSON document
-(`[scope.*]` queries) that is malformed or truncated is an error (exit 1).
+`kqq: warning: N record(s) skipped (malformed JSON)`. Row-returning queries
+read one record per line; aggregate and GROUP BY queries also accept records
+pretty-printed over several lines (nested lines indented, as JSON
+pretty-printers do) — there, a line starting with `{` in column 0 always
+begins a new record. In a single JSON document (`[scope.*]` queries) a malformed or
+truncated part that kqq reads is an error (exit 1); kqq stops reading at the
+end of the scope's array.
 `\uXXXX` escapes, including surrogate pairs, are decoded to UTF-8.
 
 Delimited input follows RFC 4180 quoting: a field in double quotes may
 contain the delimiter, newlines and doubled quotes (`"Smith, John"`,
 `"say ""hi"""`). Cells that look like plain decimal numbers become numbers
 (quoted or not); an empty unquoted cell is `null`, an empty quoted cell `""`.
+A quote that is never closed runs to the end of the input, with a warning.
 | `--llm <field>` | LLM token accumulation: extract `<field>` from each NDJSON envelope, concatenate fragments, query each completed JSON object in real time |
 | `--llm-path <p>` | Dotted path for nested extraction (e.g. `choices.0.delta.content`) |
 | `--api <preset>` | API protocol preset: `ollama` \| `openai` \| `anthropic` |
