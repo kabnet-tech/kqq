@@ -16,6 +16,13 @@ zig build test --summary all     # unit + integration tests
 python3 tests/cli_tests.py       # end-to-end CLI tests
 ```
 
+Two more checks are worth running when you touch parsing or execution:
+
+```bash
+pip install duckdb && python3 tests/differential.py   # same queries through DuckDB, compared
+zig build fuzz --fuzz=1M                               # fuzz the JSON scanner
+```
+
 ## Reporting bugs
 
 Open a [bug report](https://github.com/kabnet-tech/kqq/issues/new?template=bug_report.md)
