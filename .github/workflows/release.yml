@@ -13,6 +13,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches build.zig.zon version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          ZON_VERSION="$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon | head -1)"
+          echo "tag=$TAG_VERSION  build.zig.zon=$ZON_VERSION"
+          if [ -z "$ZON_VERSION" ]; then
+            echo "::error::could not parse .version from build.zig.zon"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$ZON_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match build.zig.zon version $ZON_VERSION - the tag is probably on the wrong commit"
+            exit 1
+          fi
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -31,6 +45,16 @@ jobs:
 
       - name: Build (ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
+
+      - name: Verify binary reports the tag version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          BIN_VERSION="$(./zig-out/bin/kqq --version | awk '{print $2}')"
+          echo "tag=$TAG_VERSION  binary=$BIN_VERSION"
+          if [ "$TAG_VERSION" != "$BIN_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match binary version $BIN_VERSION"
+            exit 1
+          fi
 
       - name: Run Zig unit tests
         run: zig build test --summary all
