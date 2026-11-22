@@ -4,7 +4,7 @@
 set -eu
 
 REPO="kabnet-tech/kqq"
-VERSION="${KQQ_VERSION:-0.9.17}"
+VERSION="${KQQ_VERSION:-0.9.18}"
 
 # Detect OS
 os=$(uname -s)

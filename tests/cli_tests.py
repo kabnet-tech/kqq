@@ -145,13 +145,13 @@ check("--version flag",
       args=["--version"],
       stdin=b"",
       expect_exit=0,
-      stdout_contains="kqq 0.9.17")
+      stdout_contains="kqq 0.9.18")
 
 check("-V short flag",
       args=["-V"],
       stdin=b"",
       expect_exit=0,
-      stdout_contains="kqq 0.9.17")
+      stdout_contains="kqq 0.9.18")
 
 check("--help flag",
       args=["--help"],
