@@ -5,7 +5,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/kabnet-tech/kqq?logo=github)](https://github.com/kabnet-tech/kqq/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows%20%7C%20FreeBSD-lightgrey)
-![Zig](https://img.shields.io/badge/zig-0.17.0-orange)
+![Zig](https://img.shields.io/badge/zig-0.17.1-orange)
 
 **SQL for streams.** Query NDJSON, JSON, CSV, and LLM token streams with SQL —
 at memory speeds, not disk speeds.
@@ -92,7 +92,7 @@ platforms, including FreeBSD and glibc/musl Linux variants. SHA256 checksums
 are published with every release.
 </details>
 
-### Build from source (requires Zig 0.17.0)
+### Build from source (requires Zig 0.17.1)
 
 ```bash
 git clone https://github.com/kabnet-tech/kqq
@@ -154,7 +154,7 @@ zig build test --summary all     # unit + integration tests
 python3 tests/cli_tests.py       # end-to-end CLI tests
 ```
 
-Requires Zig 0.17.0. No other dependencies.
+Requires Zig 0.17.1. No other dependencies.
 
 ## License
 
